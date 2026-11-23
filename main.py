@@ -685,37 +685,41 @@ class AIAdvisor:
 async def tg_send(token: str, chat_id: str, text: str):
     if not token or not chat_id:
         return
-    # قطّع الرسالة إذا كانت طويلة (Telegram حد 4096 حرف)
     if len(text) > 4000:
         text = text[:4000] + "\n..."
     url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+
     for attempt in range(5):
         try:
-            async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=5)
-            ) as s:
-                resp = await s.post(url, json={
-                    "chat_id": chat_id, "text": text,
-                    "parse_mode": "HTML",
-                }, timeout=aiohttp.ClientTimeout(total=15))
-                if resp.status == 200:
-                    return
+            # connector جديد في كل محاولة — أبسط وأكثر استقراراً
+            conn = aiohttp.TCPConnector(ssl=True, limit=3)
+            async with aiohttp.ClientSession(connector=conn) as s:
+                resp = await s.post(
+                    url, json=payload,
+                    timeout=aiohttp.ClientTimeout(total=20)
+                )
                 body = await resp.text()
-                _log(f"[TG] ⚠️ status={resp.status} {body[:120]}")
-                # 429 = Too Many Requests — نحترم retry_after
+                if resp.status == 200:
+                    _log(f"[TG] ✅ أُرسلت بنجاح")
+                    return
+                _log(f"[TG] ⚠️ status={resp.status} body={body[:150]}")
                 if resp.status == 429:
                     try:
-                        data = _json.loads(body)
-                        wait = data.get("parameters", {}).get("retry_after", 35)
+                        wait = _json.loads(body).get("parameters", {}).get("retry_after", 35)
                     except Exception:
                         wait = 35
-                    _log(f"[TG] ⏳ Rate limit — انتظار {wait}ث ثم إعادة المحاولة")
-                    await asyncio.sleep(wait + 1)
-                    continue
+                    _log(f"[TG] ⏳ انتظار {wait}ث (rate limit)")
+                    await asyncio.sleep(wait + 2)
+                elif resp.status in (400, 401, 403):
+                    _log(f"[TG] ❌ خطأ دائم ({resp.status}) — توقف")
+                    return
+                else:
+                    await asyncio.sleep(5)
         except Exception as e:
-            _log(f"[TG] ❌ attempt {attempt+1}: {e}")
+            _log(f"[TG] ❌ attempt {attempt+1}: {type(e).__name__}: {e}")
             await asyncio.sleep(5)
-    _log("[TG] ❌ فشل إرسال الرسالة بعد 5 محاولات")
+    _log("[TG] ❌ فشل الإرسال بعد 5 محاولات")
 
 
 # ══════════════════════════════════════════════════════════════
