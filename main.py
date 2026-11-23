@@ -682,7 +682,10 @@ class AIAdvisor:
 # ══════════════════════════════════════════════════════════════
 # TELEGRAM
 # ══════════════════════════════════════════════════════════════
+_tg_last_sent: float = 0.0  # وقت آخر رسالة ناجحة
+
 async def tg_send(token: str, chat_id: str, text: str):
+    global _tg_last_sent
     if not token or not chat_id:
         return
     if len(text) > 4000:
@@ -690,36 +693,41 @@ async def tg_send(token: str, chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
 
-    for attempt in range(5):
+    for attempt in range(8):
         try:
-            # connector جديد في كل محاولة — أبسط وأكثر استقراراً
-            conn = aiohttp.TCPConnector(ssl=True, limit=3)
+            conn = aiohttp.TCPConnector(ssl=True, limit=3, force_close=True)
             async with aiohttp.ClientSession(connector=conn) as s:
                 resp = await s.post(
                     url, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=20)
+                    timeout=aiohttp.ClientTimeout(
+                        total=60, connect=15, sock_read=45
+                    )
                 )
                 body = await resp.text()
                 if resp.status == 200:
-                    _log(f"[TG] ✅ أُرسلت بنجاح")
+                    _tg_last_sent = time.time()
+                    _log("[TG] ✅ أُرسلت بنجاح")
                     return
-                _log(f"[TG] ⚠️ status={resp.status} body={body[:150]}")
+                _log(f"[TG] ⚠️ status={resp.status} body={body[:200]}")
                 if resp.status == 429:
                     try:
                         wait = _json.loads(body).get("parameters", {}).get("retry_after", 35)
                     except Exception:
                         wait = 35
                     _log(f"[TG] ⏳ انتظار {wait}ث (rate limit)")
-                    await asyncio.sleep(wait + 2)
+                    await asyncio.sleep(wait + 3)
                 elif resp.status in (400, 401, 403):
                     _log(f"[TG] ❌ خطأ دائم ({resp.status}) — توقف")
                     return
                 else:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(10)
+        except asyncio.TimeoutError:
+            _log(f"[TG] ⏰ timeout — محاولة {attempt+1}/8 — انتظار 15ث")
+            await asyncio.sleep(15)
         except Exception as e:
             _log(f"[TG] ❌ attempt {attempt+1}: {type(e).__name__}: {e}")
-            await asyncio.sleep(5)
-    _log("[TG] ❌ فشل الإرسال بعد 5 محاولات")
+            await asyncio.sleep(10)
+    _log("[TG] ❌ فشل الإرسال بعد 8 محاولات")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1929,6 +1937,10 @@ class Orchestrator:
         actions = healer.run()
 
         # إشعار Telegram واحد فقط عند البدء (لتجنب 429 rate limit)
+        # انتظار 90ث عند البدء — يمنح Telegram وقتاً للتعافي من rate limit
+        # المتراكم بسبب deployments متكررة
+        _log("[TG] ⏳ انتظار 90ث قبل أول رسالة (تجنب rate limit)...")
+        await asyncio.sleep(90)
         _log("[TG] 📤 إرسال إشعار البداية...")
         await self._startup_notify()
         if actions:
