@@ -671,7 +671,7 @@ async def tg_send(token: str, chat_id: str, text: str):
     if len(text) > 4000:
         text = text[:4000] + "\n..."
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             async with aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(limit=5)
@@ -683,10 +683,21 @@ async def tg_send(token: str, chat_id: str, text: str):
                 if resp.status == 200:
                     return
                 body = await resp.text()
-                _log(f"[TG] ⚠️ status={resp.status} {body[:100]}")
+                _log(f"[TG] ⚠️ status={resp.status} {body[:120]}")
+                # 429 = Too Many Requests — نحترم retry_after
+                if resp.status == 429:
+                    try:
+                        data = _json.loads(body)
+                        wait = data.get("parameters", {}).get("retry_after", 35)
+                    except Exception:
+                        wait = 35
+                    _log(f"[TG] ⏳ Rate limit — انتظار {wait}ث ثم إعادة المحاولة")
+                    await asyncio.sleep(wait + 1)
+                    continue
         except Exception as e:
             _log(f"[TG] ❌ attempt {attempt+1}: {e}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(5)
+    _log("[TG] ❌ فشل إرسال الرسالة بعد 5 محاولات")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1580,12 +1591,11 @@ class Orchestrator:
         healer  = AutoHeal(self.cfg, self.ex, self.slots, self.db)
         actions = healer.run()
 
-        # اختبار Telegram أولاً
-        _log("[TG] 📤 اختبار الاتصال بـ Telegram...")
-        await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
-                      "🔌 <b>اختبار الاتصال</b> — Bot v5 يبدأ التشغيل...")
+        # إشعار Telegram واحد فقط عند البدء (لتجنب 429 rate limit)
+        _log("[TG] 📤 إرسال إشعار البداية...")
         await self._startup_notify()
         if actions:
+            await asyncio.sleep(2)  # فاصل صغير بين الرسائل
             await self._send_tg(
                 "🔧 <b>Auto-Heal</b>\n" +
                 "\n".join(f"  {a}" for a in actions)
