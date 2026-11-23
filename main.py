@@ -120,6 +120,24 @@ class Config:
     orderbook_enabled:   bool = field(default_factory=lambda: os.environ.get("ORDERBOOK_ENABLED", "true").lower() == "true")
     orderbook_ratio_min: float = field(default_factory=lambda: float(os.environ.get("ORDERBOOK_BUY_RATIO_MIN", "1.5")))
 
+    # ── Binance Listing Monitor ──
+    binance_listing_enabled: bool = field(default_factory=lambda: os.environ.get("BINANCE_LISTING_ENABLED", "true").lower() == "true")
+    binance_listing_interval: int = field(default_factory=lambda: int(os.environ.get("BINANCE_LISTING_INTERVAL", "120")))  # ثانية
+
+    # ── LunarCrush Social Signal ──
+    lunarcrush_enabled:  bool = field(default_factory=lambda: os.environ.get("LUNARCRUSH_ENABLED", "false").lower() == "true")
+    lunarcrush_api_key:  str  = field(default_factory=lambda: os.environ.get("LUNARCRUSH_API_KEY", ""))
+    lunarcrush_min_score: float = field(default_factory=lambda: float(os.environ.get("LUNARCRUSH_MIN_SCORE", "50")))
+
+    # ── Funding Rate (MEXC Futures) ──
+    funding_rate_enabled: bool = field(default_factory=lambda: os.environ.get("FUNDING_RATE_ENABLED", "true").lower() == "true")
+    funding_rate_threshold: float = field(default_factory=lambda: float(os.environ.get("FUNDING_RATE_THRESHOLD", "-0.001")))  # -0.1% = squeeze قادم
+
+    # ── CryptoPanic News Filter ──
+    cryptopanic_enabled: bool = field(default_factory=lambda: os.environ.get("CRYPTOPANIC_ENABLED", "false").lower() == "true")
+    cryptopanic_api_key: str  = field(default_factory=lambda: os.environ.get("CRYPTOPANIC_API_KEY", ""))
+    cryptopanic_block_negative: bool = True  # يمنع الدخول عند أخبار سلبية
+
     # ── قائمة سوداء ──
     blacklisted_assets: set = field(default_factory=lambda: {
         "AAVE","COMP","MKR","CRV","LDO","UNI","SUSHI","BAL","CAKE","YFI",
@@ -815,6 +833,255 @@ class SignalAggregator:
 
 
 # ══════════════════════════════════════════════════════════════
+# BINANCE LISTING MONITOR — أقوى إشارة (مجانية تماماً)
+# ══════════════════════════════════════════════════════════════
+class BinanceListingMonitor:
+    """
+    يراقب RSS الرسمي لـ Binance للإعلانات الجديدة.
+    عند إدراج عملة جديدة على Binance → شراء فوري على MEXC
+    (العملة ترتفع 50-200% خلال ساعة على MEXC)
+    """
+    RSS_URL = "https://www.binance.com/en/support/announcement/new-cryptocurrency-listing?c=48&navId=48"
+    API_URL = "https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageNo=1&pageSize=5&catalogId=48"
+
+    def __init__(self, cfg: Config, ex: Executor):
+        self.cfg = cfg
+        self.ex  = ex
+        self._seen_titles: set = set()
+        self._new_symbols: list = []   # عملات جديدة مكتشفة
+        self._lock = threading.Lock()
+        self._last_check: float = 0
+
+    async def check(self, session: aiohttp.ClientSession) -> list[str]:
+        """يتحقق من إعلانات Binance — يُعيد قائمة عملات جديدة"""
+        if not self.cfg.binance_listing_enabled:
+            return []
+        now = time.time()
+        if now - self._last_check < self.cfg.binance_listing_interval:
+            # أعد الرموز المكتشفة مؤخراً
+            with self._lock:
+                return list(self._new_symbols)
+        self._last_check = now
+
+        new_symbols = []
+        try:
+            async with session.get(
+                self.API_URL,
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"User-Agent": "Mozilla/5.0"},
+            ) as r:
+                if r.status != 200:
+                    return []
+                data = await r.json()
+                articles = data.get("data", {}).get("articles", []) or []
+                for art in articles:
+                    title = art.get("title", "")
+                    if title in self._seen_titles:
+                        continue
+                    self._seen_titles.add(title)
+                    # استخراج رمز العملة من العنوان
+                    sym = self._extract_symbol(title)
+                    if sym:
+                        mexc_pair = f"{sym}/USDT"
+                        if mexc_pair in self.ex.exchange.markets:
+                            new_symbols.append(mexc_pair)
+                            _log(f"[Binance📢] 🔥 إدراج جديد رُصد: {sym} — شراء فوري على MEXC!")
+        except Exception as e:
+            _log(f"[Binance📢] ⚠️ {e}")
+
+        with self._lock:
+            # الاحتفاظ بالرموز لمدة دورة واحدة فقط
+            self._new_symbols = new_symbols
+        return new_symbols
+
+    @staticmethod
+    def _extract_symbol(title: str) -> str:
+        """يستخرج رمز العملة من عنوان الإعلان مثل 'Binance Will List XYZ (XYZ)'"""
+        import re
+        # نمط 1: (XYZ) في نهاية العنوان
+        m = re.search(r'\(([A-Z]{2,10})\)\s*$', title)
+        if m:
+            return m.group(1)
+        # نمط 2: "Will List XYZ"
+        m = re.search(r'[Ll]ist\s+([A-Z]{2,10})', title)
+        if m:
+            return m.group(1)
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════
+# FUNDING RATE DETECTOR — كشف Short Squeeze
+# ══════════════════════════════════════════════════════════════
+class FundingRateDetector:
+    """
+    يفحص Funding Rate من MEXC Futures (مجاني).
+    Funding سالب جداً = الجميع يراهن هبوطاً = Short Squeeze قادم = فرصة شراء!
+    """
+    MEXC_FUNDING_URL = "https://contract.mexc.com/api/v1/contract/funding_rate"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._cache: dict[str, float] = {}   # symbol → funding_rate
+        self._last_refresh: float = 0
+
+    async def refresh(self, session: aiohttp.ClientSession):
+        """يحدث الـ funding rates كل 5 دقائق"""
+        if not self.cfg.funding_rate_enabled:
+            return
+        now = time.time()
+        if now - self._last_refresh < 300:
+            return
+        self._last_refresh = now
+        try:
+            async with session.get(
+                self.MEXC_FUNDING_URL,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    return
+                data = await r.json()
+                items = data.get("data", []) or []
+                cache = {}
+                for item in items:
+                    sym = item.get("symbol", "").replace("_", "/").replace("USDT", "/USDT")
+                    # تحويل MX_BTCUSDT → BTC/USDT
+                    sym = sym.replace("MX_", "").replace("USDT", "").rstrip("/")
+                    if sym:
+                        rate = float(item.get("fundingRate", 0))
+                        cache[sym + "/USDT"] = rate
+                self._cache = cache
+                negative = {s: r for s, r in cache.items() if r <= self.cfg.funding_rate_threshold}
+                if negative:
+                    top = sorted(negative.items(), key=lambda x: x[1])[:5]
+                    _log(f"[Funding] 📉 Squeeze candidates: " +
+                         ", ".join(f"{s}={r:.4f}" for s, r in top))
+        except Exception as e:
+            _log(f"[Funding] ⚠️ {e}")
+
+    def is_squeeze_candidate(self, symbol: str) -> bool:
+        """يُعيد True إذا كان Funding Rate سالب جداً (فرصة Short Squeeze)"""
+        if not self.cfg.funding_rate_enabled:
+            return False
+        rate = self._cache.get(symbol, 0)
+        return rate <= self.cfg.funding_rate_threshold
+
+    def get_rate(self, symbol: str) -> float:
+        return self._cache.get(symbol, 0.0)
+
+
+# ══════════════════════════════════════════════════════════════
+# CRYPTOPANIC NEWS FILTER — فلتر الأخبار السلبية
+# ══════════════════════════════════════════════════════════════
+class CryptoPanicFilter:
+    """
+    يفلتر الأخبار السلبية قبل الدخول — يمنع الشراء وقت الأخبار الحمراء.
+    مجاني بدون مفتاح (بيانات محدودة) أو بمفتاح مجاني (أفضل).
+    """
+    BASE_URL = "https://cryptopanic.com/api/v1/posts/"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._negative_coins: set = set()  # عملات عليها أخبار سلبية حالية
+        self._last_refresh: float = 0
+
+    async def refresh(self, session: aiohttp.ClientSession):
+        """يحدث الأخبار كل 10 دقائق"""
+        if not self.cfg.cryptopanic_enabled:
+            return
+        now = time.time()
+        if now - self._last_refresh < 600:
+            return
+        self._last_refresh = now
+
+        params = {"filter": "negative", "public": "true"}
+        if self.cfg.cryptopanic_api_key:
+            params["auth_token"] = self.cfg.cryptopanic_api_key
+
+        try:
+            async with session.get(
+                self.BASE_URL,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    return
+                data = await r.json()
+                negative = set()
+                for post in data.get("results", []):
+                    for currency in post.get("currencies", []):
+                        sym = currency.get("code", "").upper()
+                        if sym:
+                            negative.add(sym)
+                old_count = len(self._negative_coins)
+                self._negative_coins = negative
+                if negative:
+                    _log(f"[News🔴] {len(negative)} عملة عليها أخبار سلبية (منع الدخول)")
+        except Exception as e:
+            _log(f"[News🔴] ⚠️ {e}")
+
+    def is_blocked(self, symbol: str) -> bool:
+        """يُعيد True إذا كانت العملة عليها أخبار سلبية"""
+        if not self.cfg.cryptopanic_enabled or not self.cfg.cryptopanic_block_negative:
+            return False
+        base = symbol.split("/")[0].upper()
+        return base in self._negative_coins
+
+
+# ══════════════════════════════════════════════════════════════
+# LUNARCRUSH SOCIAL SIGNAL (اختياري — يتطلب مفتاح API)
+# ══════════════════════════════════════════════════════════════
+class LunarCrushSignal:
+    """
+    يجلب Galaxy Score + Social Volume من LunarCrush.
+    ارتفاع مفاجئ في Social Score = إشارة مبكرة قبل السعر.
+    مجاني: 100 طلب/يوم — يُفعّل فقط إذا كان API key موجوداً.
+    """
+    BASE_URL = "https://lunarcrush.com/api4/public/coins/list/v2"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._scores: dict[str, float] = {}   # symbol → galaxy_score
+        self._last_refresh: float = 0
+
+    async def refresh(self, session: aiohttp.ClientSession):
+        """يحدث النتائج كل ساعة (توفيراً للطلبات المجانية)"""
+        if not self.cfg.lunarcrush_enabled or not self.cfg.lunarcrush_api_key:
+            return
+        now = time.time()
+        if now - self._last_refresh < 3600:
+            return
+        self._last_refresh = now
+        try:
+            async with session.get(
+                self.BASE_URL,
+                headers={"Authorization": f"Bearer {self.cfg.lunarcrush_api_key}"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    _log(f"[LunarCrush] ⚠️ status={r.status}")
+                    return
+                data = await r.json()
+                scores = {}
+                for coin in data.get("data", []):
+                    sym = coin.get("symbol", "").upper()
+                    score = float(coin.get("galaxy_score", 0))
+                    if sym:
+                        scores[sym] = score
+                self._scores = scores
+                top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:5]
+                _log(f"[LunarCrush🌙] Top: " + ", ".join(f"{s}={sc:.0f}" for s, sc in top))
+        except Exception as e:
+            _log(f"[LunarCrush] ⚠️ {e}")
+
+    def get_score(self, symbol: str) -> float:
+        base = symbol.split("/")[0].upper()
+        return self._scores.get(base, 0.0)
+
+    def is_hot(self, symbol: str) -> bool:
+        return self.get_score(symbol) >= self.cfg.lunarcrush_min_score
+
+
+# ══════════════════════════════════════════════════════════════
 # STRATEGY ENGINE
 # ══════════════════════════════════════════════════════════════
 class StrategyEngine:
@@ -1272,6 +1539,10 @@ class Orchestrator:
         self.strategy  = StrategyEngine(cfg, self.ex)
         self.ai        = AIAdvisor(cfg)
         self.signals   = SignalAggregator(cfg, self.ex, self.db)
+        self.binance   = BinanceListingMonitor(cfg, self.ex)
+        self.funding   = FundingRateDetector(cfg)
+        self.news      = CryptoPanicFilter(cfg)
+        self.lunar     = LunarCrushSignal(cfg)
         self._processing: set = set()
         self._processing_lock = threading.Lock()
         self._report_tick = 0
@@ -1300,6 +1571,14 @@ class Orchestrator:
             sources.append("🌊 Volume Anomaly")
         if self.cfg.orderbook_enabled:
             sources.append("📚 Order Book")
+        if self.cfg.binance_listing_enabled:
+            sources.append("📢 Binance Listing")
+        if self.cfg.funding_rate_enabled:
+            sources.append("📉 Funding Rate")
+        if self.cfg.cryptopanic_enabled:
+            sources.append("🔴 News Filter")
+        if self.cfg.lunarcrush_enabled:
+            sources.append("🌙 LunarCrush")
 
         text = (
             "🚀 <b>MEXC Scalping Bot v5 — Ultra Rocket Edition</b>\n"
@@ -1371,6 +1650,23 @@ class Orchestrator:
             except Exception:
                 return
 
+            # فلتر الأخبار السلبية (CryptoPanic)
+            if self.news.is_blocked(symbol):
+                _log(f"[News🔴] ⚠️ {symbol} عليها أخبار سلبية — تخطي")
+                return
+
+            # Funding Rate — إضافة نقاط إذا كان squeeze candidate
+            if self.funding.is_squeeze_candidate(symbol):
+                rate = self.funding.get_rate(symbol)
+                _log(f"[Funding📉] 🎯 {symbol} Funding={rate:.4f} — Squeeze قادم! نقاط إضافية")
+                signal["funding_boost"] = True
+
+            # LunarCrush — إشارة اجتماعية
+            if self.cfg.lunarcrush_enabled and self.lunar.is_hot(symbol):
+                score = self.lunar.get_score(symbol)
+                _log(f"[LunarCrush🌙] 🔥 {symbol} Galaxy Score={score:.0f} — ضجة اجتماعية!")
+                signal["lunar_boost"] = True
+
             # Order Book Pressure — فلتر إضافي
             if self.cfg.orderbook_enabled and not force_new_listing:
                 ob_ratio = await asyncio.get_event_loop().run_in_executor(
@@ -1434,7 +1730,12 @@ class Orchestrator:
 
             # إشعار Telegram
             emoji   = {"S3": "🚀", "NEW_LISTING": "🆕", "S1": "📉", "S2": "📈"}.get(signal["strategy"], "📊")
-            ob_note = " 📚✅" if signal.get("ob_boost") else ""
+            boosts = []
+            if signal.get("ob_boost"):        boosts.append("📚 Order Book")
+            if signal.get("funding_boost"):   boosts.append("📉 Funding Squeeze")
+            if signal.get("lunar_boost"):     boosts.append("🌙 Social Buzz")
+            if signal_source == "binance_listing": boosts.append("📢 Binance Listed!")
+            boost_note = (" | " + " + ".join(boosts)) if boosts else ""
             src_tag = f" [{signal_source}]" if signal_source != "scan" else ""
             await self._send_tg(
                 f"{emoji} <b>{signal['strategy']} — {symbol}</b>{src_tag}\n"
@@ -1442,7 +1743,7 @@ class Orchestrator:
                 f"💰 رأس المال: <code>${capital:.2f}</code>\n"
                 f"📍 دخول: <code>{price:.6g}</code>\n"
                 f"📊 RSI={signal['rsi']:.0f} | "
-                f"Gain={signal['gain_pct']:.1f}% | Vol×{signal['vol_ratio']:.1f}{ob_note}\n"
+                f"Gain={signal['gain_pct']:.1f}% | Vol×{signal['vol_ratio']:.1f}{boost_note}\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 TP1: <code>{targets['tp1']:.6g}</code>\n"
                 f"🎯 TP2: <code>{targets['tp2']:.6g}</code>\n"
@@ -1506,11 +1807,43 @@ class Orchestrator:
                 elif balance < capital * 0.5 and self.slots.used == 0:
                     _log(f"[Scan] رصيد ${balance:.2f} منخفض جداً")
                 else:
-                    # 1. تحديث مصادر الإشارات
+                    # 1. تحديث مصادر الإشارات (الأصلية + الجديدة)
                     try:
                         await self.signals.refresh(session)
                     except Exception as e:
                         _log(f"[Signals] ⚠️ {e}")
+
+                    # Binance Listing Monitor — أقوى إشارة
+                    try:
+                        binance_new = await self.binance.check(session)
+                        for sym in binance_new:
+                            if self.slots.is_vacant(sym):
+                                _log(f"[Binance📢] 🔥 شراء فوري: {sym}")
+                                await self._process_symbol(
+                                    session, sym, capital,
+                                    signal_source="binance_listing",
+                                    force_new_listing=True
+                                )
+                    except Exception as e:
+                        _log(f"[Binance📢] ⚠️ {e}")
+
+                    # تحديث Funding Rate
+                    try:
+                        await self.funding.refresh(session)
+                    except Exception as e:
+                        _log(f"[Funding] ⚠️ {e}")
+
+                    # تحديث أخبار CryptoPanic
+                    try:
+                        await self.news.refresh(session)
+                    except Exception as e:
+                        _log(f"[News] ⚠️ {e}")
+
+                    # تحديث LunarCrush
+                    try:
+                        await self.lunar.refresh(session)
+                    except Exception as e:
+                        _log(f"[LunarCrush] ⚠️ {e}")
 
                     # 2. الحصول على العملات المرشّحة مرتّبة
                     priority_syms = self.signals.get_priority_symbols()
