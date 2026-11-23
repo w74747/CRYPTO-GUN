@@ -671,16 +671,22 @@ async def tg_send(token: str, chat_id: str, text: str):
     if len(text) > 4000:
         text = text[:4000] + "\n..."
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    for _ in range(3):
+    for attempt in range(3):
         try:
-            async with aiohttp.ClientSession() as s:
-                await s.post(url, json={
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=5)
+            ) as s:
+                resp = await s.post(url, json={
                     "chat_id": chat_id, "text": text,
                     "parse_mode": "HTML",
-                }, timeout=aiohttp.ClientTimeout(total=10))
-            return
-        except Exception:
-            await asyncio.sleep(2)
+                }, timeout=aiohttp.ClientTimeout(total=15))
+                if resp.status == 200:
+                    return
+                body = await resp.text()
+                _log(f"[TG] ⚠️ status={resp.status} {body[:100]}")
+        except Exception as e:
+            _log(f"[TG] ❌ attempt {attempt+1}: {e}")
+            await asyncio.sleep(3)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1471,7 +1477,8 @@ class Orchestrator:
         2. فحص العملات المرشّحة بالأولوية (أسرع بكثير من فحص 3000 عملة)
         3. فحص New Listings بشكل خاص
         """
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(limit=20, limit_per_host=5)
+        async with aiohttp.ClientSession(connector=connector) as session:
             scan_count    = 0
             new_listings_check_tick = 0
 
@@ -1499,8 +1506,8 @@ class Orchestrator:
 
                     if priority_syms:
                         _log(f"[Scan] 🎯 فحص {len(priority_syms)} عملة مرشّحة")
-                        # فحص العملات ذات الأولوية العالية
-                        BATCH = 10
+                        # فحص العملات ذات الأولوية العالية — batch صغير لتجنب pool overflow
+                        BATCH = 5
                         for i in range(0, len(priority_syms), BATCH):
                             if self.slots.free == 0:
                                 break
@@ -1573,6 +1580,10 @@ class Orchestrator:
         healer  = AutoHeal(self.cfg, self.ex, self.slots, self.db)
         actions = healer.run()
 
+        # اختبار Telegram أولاً
+        _log("[TG] 📤 اختبار الاتصال بـ Telegram...")
+        await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
+                      "🔌 <b>اختبار الاتصال</b> — Bot v5 يبدأ التشغيل...")
         await self._startup_notify()
         if actions:
             await self._send_tg(
