@@ -863,7 +863,13 @@ class SignalAggregator:
             for sym in anomalies:
                 candidates[sym] = candidates.get(sym, 0) + 7
 
-        # 5. تحديث القائمة المدمجة
+        # 5. SAFE_COINS — مضمونة التداول، أضفها دائماً بوزن متوسط
+        for sym in self.ex.SAFE_COINS:
+            base = sym.replace("/USDT", "")
+            if base not in self.ex._geo_blocked:
+                candidates[sym] = candidates.get(sym, 0) + 3  # وزن منخفض كـ fallback
+
+        # 6. تحديث القائمة المدمجة
         with self._lock:
             self._candidates = candidates
 
