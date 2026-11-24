@@ -352,6 +352,7 @@ class SlotState:
     partial1_done: bool          = False
     partial2_done: bool          = False
     remaining_qty: float         = 0.0
+    atr_pct:       float         = 0.0   # ATR% عند فتح الصفقة (للـ trailing)
 
 
 class SlotManager:
@@ -1613,60 +1614,105 @@ class TradeMonitor:
             return
 
     async def _handle_s3_partials(self, state: SlotState, price: float, pnl_pct: float):
-        cfg = self.cfg
-        if not state.partial1_done and pnl_pct >= cfg.s3_partial1_pct:
-            qty = state.filled_qty * cfg.s3_partial1_ratio
-            ok  = await asyncio.get_event_loop().run_in_executor(
-                None, self.ex.market_sell, state.symbol, qty
-            )
-            if ok:
-                remaining = state.remaining_qty - qty if state.remaining_qty > 0 else \
-                            state.filled_qty * (1 - cfg.s3_partial1_ratio)
-                self.slots.update(state.symbol, partial1_done=True, remaining_qty=remaining)
-                pnl_usd = (price - state.entry_price) * qty
-                _log(f"[Monitor] 💰 Partial1 {state.symbol} +{pnl_pct:.1f}% pnl=${pnl_usd:.2f}")
-                await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
-                    f"💰 <b>Partial1 — {state.symbol}</b>\n"
-                    f"+{pnl_pct:.1f}% | بيع 30% | ربح: ${pnl_usd:.2f}", "trade_close"
-                )
-        elif state.partial1_done and not state.partial2_done and pnl_pct >= cfg.s3_partial2_pct:
-            qty = state.filled_qty * cfg.s3_partial2_ratio
-            ok  = await asyncio.get_event_loop().run_in_executor(
-                None, self.ex.market_sell, state.symbol, qty
-            )
-            if ok:
-                remaining = state.remaining_qty - qty
-                self.slots.update(state.symbol, partial2_done=True, remaining_qty=max(0, remaining))
-                pnl_usd = (price - state.entry_price) * qty
-                _log(f"[Monitor] 💰 Partial2 {state.symbol} +{pnl_pct:.1f}% pnl=${pnl_usd:.2f}")
-                await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
-                    f"💰 <b>Partial2 — {state.symbol}</b>\n"
-                    f"+{pnl_pct:.1f}% | بيع 30% إضافية | ربح: ${pnl_usd:.2f}", "trade_close"
-                )
-
-    async def _update_trailing(self, state: SlotState, price: float, pnl_pct: float):
-        trigger = self.cfg.s3_trailing_pct if state.strategy in ("S3", "NEW_LISTING") else self.cfg.trailing_trigger
-        trail   = self.cfg.s3_trailing_pct if state.strategy in ("S3", "NEW_LISTING") else self.cfg.trailing_pct
-
-        if pnl_pct < trigger:
+        """
+        نظام هدفين:
+        - TP1: بيع 50% عند الهدف الأول → ربح مضمون
+        - الباقي 50%: trailing stop ديناميكي يتبع السعر للأعلى
+        """
+        if state.partial1_done:
+            # المرحلة الثانية: trailing للباقي فقط — يتولاها _update_trailing
             return
 
-        new_trail_sl = state.highest_price * (1 - trail / 100)
+        # TP1 لم يُحقَّق بعد → لا شيء
+        if price < state.tp1_price:
+            return
+
+        # ✅ وصل لـ TP1 → بيع 50% الآن
+        qty_tp1 = state.filled_qty * 0.50
+        ok = await asyncio.get_event_loop().run_in_executor(
+            None, self.ex.market_sell, state.symbol, qty_tp1
+        )
+        if ok:
+            remaining = state.filled_qty * 0.50
+            pnl_usd   = (price - state.entry_price) * qty_tp1
+
+            # رفع SL للباقي إلى نقطة التعادل (entry) لحماية الربح
+            breakeven_sl = state.entry_price * 1.001  # +0.1% فوق الدخول
+            self.slots.update(state.symbol,
+                partial1_done=True,
+                remaining_qty=remaining,
+                sl_price=breakeven_sl,   # SL عند نقطة التعادل
+                trailing_sl=breakeven_sl
+            )
+            if state.db_trade_id:
+                self.db.update_sl(state.db_trade_id, breakeven_sl)
+
+            _log(f"[Monitor] 🎯 TP1 {state.symbol} +{pnl_pct:.1f}% | "
+                 f"بيع 50% | SL→تعادل={breakeven_sl:.6g} | متابعة {remaining:.4f} بـ trailing")
+
+            await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
+                f"🎯 <b>TP1 — {state.symbol}</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ بيع 50% عند +{pnl_pct:.1f}%\n"
+                f"💰 ربح مؤمَّن: <code>${pnl_usd:.2f}</code>\n"
+                f"🔄 الباقي 50% يتابع بـ Trailing Stop\n"
+                f"🛡 SL جديد → نقطة التعادل", "trade_close"
+            )
+
+    async def _update_trailing(self, state: SlotState, price: float, pnl_pct: float):
+        """
+        Trailing Stop ديناميكي:
+        - قبل TP1: يبدأ فقط إذا تجاوز السعر نسبة معينة (للحماية من الانخفاض المفاجئ)
+        - بعد TP1: يتبع كل ارتفاع بـ ATR واحد تحت القمة
+        """
+        if not state.partial1_done:
+            # قبل TP1: trailing بسيط للحماية من انهيار مفاجئ
+            trigger = 5.0  # لا يبدأ trailing إلا بعد +5%
+            trail_pct = 3.0
+            if pnl_pct < trigger:
+                return
+            new_trail_sl = state.highest_price * (1 - trail_pct / 100)
+        else:
+            # بعد TP1: trailing أضيق يتبع كل قمة جديدة
+            # استخدم ATR لتحديد المسافة (1.5× ATR تحت القمة)
+            atr_pct = state.atr_pct if state.atr_pct > 0 else 2.0
+            trail_pct = max(1.5, min(4.0, atr_pct * 1.5))
+            new_trail_sl = state.highest_price * (1 - trail_pct / 100)
+
         if new_trail_sl > state.trailing_sl:
             self.slots.update(state.symbol, trailing_sl=new_trail_sl)
             if new_trail_sl > state.sl_price:
                 self.slots.update(state.symbol, sl_price=new_trail_sl)
                 if state.db_trade_id:
                     self.db.update_sl(state.db_trade_id, new_trail_sl)
+                _log(f"[Monitor] 📈 Trailing {state.symbol} → SL={new_trail_sl:.6g} "
+                     f"(قمة={state.highest_price:.6g} trail={trail_pct:.1f}%)")
 
     async def _on_tp1_filled(self, state: SlotState, price: float):
+        """TP1 عبر limit order على MEXC — نفس منطق _handle_s3_partials"""
         pnl_pct = (price - state.entry_price) / state.entry_price * 100
-        pnl_usd = (price - state.entry_price) * state.filled_qty * 0.8
+        qty_tp1 = state.filled_qty * 0.50
+        pnl_usd = (price - state.entry_price) * qty_tp1
+
+        remaining = state.filled_qty * 0.50
+        breakeven_sl = state.entry_price * 1.001
+        self.slots.update(state.symbol,
+            partial1_done=True,
+            remaining_qty=remaining,
+            sl_price=breakeven_sl,
+            trailing_sl=breakeven_sl
+        )
         if state.db_trade_id:
-            self.db.close_trade(state.db_trade_id, price, state.filled_qty * 0.8, "tp1", pnl_usd, pnl_pct)
-        self.slots.release(state.symbol)
+            self.db.update_sl(state.db_trade_id, breakeven_sl)
+
+        _log(f"[Monitor] 🎯 TP1 filled {state.symbol} +{pnl_pct:.1f}% | trailing يبدأ")
         await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
-            f"🎯 <b>TP1 — {state.symbol}</b>\n+{pnl_pct:.1f}% | ربح: ${pnl_usd:.2f}", "trade_close"
+            f"🎯 <b>TP1 — {state.symbol}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ بيع 50% عند +{pnl_pct:.1f}%\n"
+            f"💰 ربح مؤمَّن: <code>${pnl_usd:.2f}</code>\n"
+            f"🔄 الباقي 50% يتابع بـ Trailing Stop\n"
+            f"🛡 SL جديد → نقطة التعادل", "trade_close"
         )
 
     async def _close_position(self, state: SlotState, price: float, reason: str):
@@ -2031,6 +2077,7 @@ class Orchestrator:
                 None, self.ex.place_limit_sell, symbol, qty, targets["tp1"]
             )
 
+            atr_now = self.strategy._calc_atr(symbol, "1h", 14)
             state = SlotState(
                 symbol=symbol, strategy=signal["strategy"],
                 signal_source=signal_source,
@@ -2038,6 +2085,7 @@ class Orchestrator:
                 capital=capital, sl_price=targets["sl"],
                 tp1_price=targets["tp1"], tp2_price=targets["tp2"], tp3_price=targets["tp3"],
                 tp1_order_id=tp1_oid or "", db_trade_id=None, highest_price=price,
+                atr_pct=atr_now,
             )
 
             trade_id = self.db.upsert_trade(
