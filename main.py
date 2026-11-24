@@ -60,7 +60,7 @@ class Config:
     reconcile_interval: int   = field(default_factory=lambda: int(os.environ.get("RECONCILE_INTERVAL_SECONDS", "180")))
 
     # ── فلاتر عامة ──
-    min_volume_usd:     float = field(default_factory=lambda: float(os.environ.get("MIN_DAILY_VOLUME_USD", "500000")))
+    min_volume_usd:     float = field(default_factory=lambda: float(os.environ.get("MIN_DAILY_VOLUME_USD", "50000")))
     market_spot:        bool  = True
 
     # ── S1: RSI Bounce ──
@@ -81,9 +81,9 @@ class Config:
 
     # ── S3: Rocket Detector (الرئيسي) ──
     s3_enabled:         bool  = field(default_factory=lambda: os.environ.get("S3_ENABLED", "true").lower() == "true")
-    s3_gain_1h_min:     float = field(default_factory=lambda: float(os.environ.get("S3_GAIN_1H_MIN", "5.0")))
-    s3_gain_4h_min:     float = field(default_factory=lambda: float(os.environ.get("S3_GAIN_4H_MIN", "10.0")))
-    s3_vol_spike:       float = field(default_factory=lambda: float(os.environ.get("S3_VOL_SPIKE", "3.0")))
+    s3_gain_1h_min:     float = field(default_factory=lambda: float(os.environ.get("S3_GAIN_1H_MIN", "3.0")))
+    s3_gain_4h_min:     float = field(default_factory=lambda: float(os.environ.get("S3_GAIN_4H_MIN", "7.0")))
+    s3_vol_spike:       float = field(default_factory=lambda: float(os.environ.get("S3_VOL_SPIKE", "2.0")))
     s3_rsi_max:         float = field(default_factory=lambda: float(os.environ.get("S3_RSI_MAX", "80")))
     s3_partial1_pct:    float = field(default_factory=lambda: float(os.environ.get("S3_PARTIAL1_PCT", "8.0")))
     s3_partial2_pct:    float = field(default_factory=lambda: float(os.environ.get("S3_PARTIAL2_PCT", "15.0")))
@@ -91,7 +91,7 @@ class Config:
     s3_partial2_ratio:  float = field(default_factory=lambda: float(os.environ.get("S3_PARTIAL2_RATIO", "0.30")))
     s3_trailing_pct:    float = field(default_factory=lambda: float(os.environ.get("S3_TRAILING_PCT", "8.0")))
     s3_sl_pct:          float = field(default_factory=lambda: float(os.environ.get("S3_SL_PCT", "4.0")))
-    s3_min_vol_usd:     float = field(default_factory=lambda: float(os.environ.get("S3_MIN_VOL_USD", "100000")))
+    s3_min_vol_usd:     float = field(default_factory=lambda: float(os.environ.get("S3_MIN_VOL_USD", "30000")))
 
     # ── Trailing Stop عام ──
     trailing_trigger:   float = field(default_factory=lambda: float(os.environ.get("TRAILING_TRIGGER_PCT", "1.5")))
@@ -1658,6 +1658,7 @@ class Orchestrator:
                                 ticker.get("baseVolume", 0) * signal["price"])
                 min_vol = 10000 if force_new_listing else self.cfg.min_volume_usd
                 if vol_usd < min_vol:
+                    _log(f"[Vol] ⬇️ {symbol} حجم ${vol_usd:.0f} < ${min_vol:.0f} — تخطي")
                     return
             except Exception:
                 return
