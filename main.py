@@ -447,10 +447,11 @@ class Executor:
         except Exception as e:
             err = str(e)
             _log(f"[Executor] ❌ market_buy {symbol}: {e}")
-            # 11444 = قيود جغرافية — أضف للـ blacklist تلقائياً
-            if "11444" in err:
-                self._geo_blocked.add(symbol.replace("/USDT", ""))
-                _log(f"[Executor] ⛔ {symbol} محجوبة جغرافياً — أُضيفت للـ blacklist")
+            # 11444 = قيود جغرافية / 70015 = لا يمكن التداول / 10007 = لا يدعم API
+            if "11444" in err or "70015" in err or "10007" in err:
+                base = symbol.replace("/USDT", "")
+                self._geo_blocked.add(base)
+                _log(f"[Executor] ⛔ {symbol} غير متاح — أُضيف للـ blacklist")
         return None
 
     def place_limit_sell(self, symbol: str, qty: float, price: float) -> Optional[str]:
@@ -517,6 +518,13 @@ class Executor:
         يجلب أفضل N رابح من MEXC مباشرة.
         أسرع بكثير من فحص 3000 عملة!
         """
+        # Tokenized stocks — محجوبة في معظم الدول
+        _TOKENIZED_SUFFIXES = ("ON", "STOCK", "X")  # NVDAON, JNJSTOCK, NVDAX
+        def _is_tokenized(sym: str) -> bool:
+            base = sym.replace("/USDT", "")
+            return any(base.endswith(s) and len(base) > len(s) + 2
+                       for s in _TOKENIZED_SUFFIXES)
+
         try:
             tickers = self.exchange.fetch_tickers()
             self._tickers_cache = tickers  # حفظ صريح للـ cache
@@ -524,6 +532,8 @@ class Executor:
             for symbol, t in tickers.items():
                 if not symbol.endswith("/USDT"):
                     continue
+                if _is_tokenized(symbol):
+                    continue  # تخطي Tokenized Stocks
                 pct = float(t.get("percentage") or t.get("change") or 0)
                 vol_usd = float(t.get("quoteVolume") or 0)
                 if pct >= min_pct and vol_usd > 50000:
