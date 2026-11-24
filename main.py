@@ -487,7 +487,7 @@ class Executor:
             return None
 
     def market_sell(self, symbol: str, qty: float) -> bool:
-        for attempt in range(1, 6):
+        for attempt in range(1, 4):  # 3 محاولات فقط
             try:
                 prec = float(self.exchange.amount_to_precision(symbol, qty))
                 if prec <= 0:
@@ -507,8 +507,13 @@ class Executor:
                     pass
                 return False
             except Exception as e:
+                err = str(e)
+                # 30002 = أقل من الحد الأدنى ($1) — غبار لا يمكن بيعه → تجاهل
+                if "30002" in err or "minimum" in err.lower():
+                    _log(f"[Executor] ⚠️ {symbol} أقل من الحد الأدنى — تجاهل (غبار)")
+                    return False
                 _log(f"[Executor] market_sell {symbol} attempt {attempt}: {e}")
-                time.sleep(1)
+                time.sleep(2)
         return False
 
     def cancel_order(self, symbol: str, order_id: str):
@@ -757,11 +762,15 @@ class AIAdvisor:
 
 
 # ══════════════════════════════════════════════════════════════
-# TELEGRAM
+# TELEGRAM — queue ذكي، رسائل مهمة فقط
 # ══════════════════════════════════════════════════════════════
-_tg_last_sent: float = 0.0  # وقت آخر رسالة ناجحة
-_tg_lock: asyncio.Lock = None  # global lock — رسالة واحدة في الوقت
-_tg_queue: asyncio.Queue = None  # queue لتسلسل الرسائل
+_tg_last_sent:  float = 0.0
+_tg_lock:       asyncio.Lock = None
+_tg_queue:      asyncio.Queue = None
+_tg_worker_running: bool = False
+
+# أنواع الرسائل المقبولة فقط (تصفية صارمة)
+TG_IMPORTANT = {"trade_open", "trade_close", "alert_rocket", "alert_nofunds"}
 
 def _get_tg_lock():
     global _tg_lock
@@ -769,57 +778,74 @@ def _get_tg_lock():
         _tg_lock = asyncio.Lock()
     return _tg_lock
 
-async def _tg_send_raw(token: str, chat_id: str, text: str):
-    """إرسال مباشر — يُستدعى فقط من داخل tg_send مع lock مكتسب"""
-    global _tg_last_sent
+def _get_tg_queue():
+    global _tg_queue
+    if _tg_queue is None:
+        _tg_queue = asyncio.Queue(maxsize=20)
+    return _tg_queue
+
+async def _tg_worker(token: str, chat_id: str):
+    """Worker يُرسل من الـ queue بتسلسل"""
+    global _tg_worker_running, _tg_last_sent
+    _tg_worker_running = True
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-
-    # فاصل زمني إجباري بين الرسائل
-    now = time.time()
-    elapsed = now - _tg_last_sent
-    if elapsed < 3.0:
-        await asyncio.sleep(3.0 - elapsed)
-
-    for attempt in range(3):
+    while True:
         try:
-            conn = aiohttp.TCPConnector(ssl=True, limit=3, force_close=True)
-            async with aiohttp.ClientSession(connector=conn) as s:
-                resp = await s.post(
-                    url, json=payload,
-                    timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
-                )
-                body = await resp.text()
-                if resp.status == 200:
-                    _tg_last_sent = time.time()
-                    _log("[TG] ✅ أُرسلت بنجاح")
-                    return
-                _log(f"[TG] ⚠️ status={resp.status} body={body[:120]}")
-                if resp.status == 429:
-                    try:
-                        wait = _json.loads(body).get("parameters", {}).get("retry_after", 30)
-                    except Exception:
-                        wait = 30
-                    _log(f"[TG] ⏳ انتظار {wait}ث (rate limit)")
-                    await asyncio.sleep(wait + 2)
-                elif resp.status in (400, 401, 403):
-                    _log(f"[TG] ❌ خطأ دائم ({resp.status}) — توقف")
-                    return
-                else:
+            text = await asyncio.wait_for(_get_tg_queue().get(), timeout=60)
+            if text is None:
+                break
+            # فاصل إجباري 4 ثانية بين الرسائل
+            elapsed = time.time() - _tg_last_sent
+            if elapsed < 4.0:
+                await asyncio.sleep(4.0 - elapsed)
+            # محاولة الإرسال
+            for attempt in range(3):
+                try:
+                    conn = aiohttp.TCPConnector(ssl=True, limit=2, force_close=True)
+                    async with aiohttp.ClientSession(connector=conn) as s:
+                        resp = await s.post(url,
+                            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                            timeout=aiohttp.ClientTimeout(total=20, connect=8))
+                        body = await resp.text()
+                        if resp.status == 200:
+                            _tg_last_sent = time.time()
+                            _log("[TG] ✅ أُرسلت")
+                            break
+                        if resp.status == 429:
+                            wait = _json.loads(body).get("parameters", {}).get("retry_after", 30)
+                            _log(f"[TG] ⏳ {wait}ث rate-limit")
+                            await asyncio.sleep(wait + 2)
+                        elif resp.status in (400, 401, 403):
+                            _log(f"[TG] ❌ خطأ دائم {resp.status}")
+                            break
+                        else:
+                            await asyncio.sleep(5)
+                except Exception as e:
+                    _log(f"[TG] ❌ attempt {attempt+1}: {type(e).__name__}: {str(e)[:50]}")
                     await asyncio.sleep(5)
+        except asyncio.TimeoutError:
+            continue
         except Exception as e:
-            _log(f"[TG] ❌ attempt {attempt+1}: {type(e).__name__}: {str(e)[:60]}")
+            _log(f"[TG] worker error: {e}")
             await asyncio.sleep(5)
-    _log("[TG] ❌ فشل الإرسال بعد 3 محاولات — تجاهل")
 
-async def tg_send(token: str, chat_id: str, text: str):
+async def tg_send(token: str, chat_id: str, text: str, msg_type: str = "misc"):
+    """إرسال رسالة Telegram — يقبل فقط الأنواع المهمة"""
     if not token or not chat_id:
+        return
+    # تصفية: فقط الأنواع المهمة
+    if msg_type not in TG_IMPORTANT:
         return
     if len(text) > 4000:
         text = text[:4000] + "\n..."
-    # lock يضمن إرسال رسالة واحدة في كل مرة
-    async with _get_tg_lock():
-        await _tg_send_raw(token, chat_id, text)
+    global _tg_worker_running
+    if not _tg_worker_running:
+        asyncio.create_task(_tg_worker(token, chat_id))
+    q = _get_tg_queue()
+    if not q.full():
+        await q.put(text)
+    else:
+        _log("[TG] ⚠️ queue ممتلئ — رسالة تُجاهل")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1505,7 +1531,7 @@ class TradeMonitor:
                 _log(f"[Monitor] 💰 Partial1 {state.symbol} +{pnl_pct:.1f}% pnl=${pnl_usd:.2f}")
                 await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
                     f"💰 <b>Partial1 — {state.symbol}</b>\n"
-                    f"+{pnl_pct:.1f}% | بيع 30% | ربح: ${pnl_usd:.2f}"
+                    f"+{pnl_pct:.1f}% | بيع 30% | ربح: ${pnl_usd:.2f}", "trade_close"
                 )
         elif state.partial1_done and not state.partial2_done and pnl_pct >= cfg.s3_partial2_pct:
             qty = state.filled_qty * cfg.s3_partial2_ratio
@@ -1519,7 +1545,7 @@ class TradeMonitor:
                 _log(f"[Monitor] 💰 Partial2 {state.symbol} +{pnl_pct:.1f}% pnl=${pnl_usd:.2f}")
                 await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
                     f"💰 <b>Partial2 — {state.symbol}</b>\n"
-                    f"+{pnl_pct:.1f}% | بيع 30% إضافية | ربح: ${pnl_usd:.2f}"
+                    f"+{pnl_pct:.1f}% | بيع 30% إضافية | ربح: ${pnl_usd:.2f}", "trade_close"
                 )
 
     async def _update_trailing(self, state: SlotState, price: float, pnl_pct: float):
@@ -1544,7 +1570,7 @@ class TradeMonitor:
             self.db.close_trade(state.db_trade_id, price, state.filled_qty * 0.8, "tp1", pnl_usd, pnl_pct)
         self.slots.release(state.symbol)
         await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
-            f"🎯 <b>TP1 — {state.symbol}</b>\n+{pnl_pct:.1f}% | ربح: ${pnl_usd:.2f}"
+            f"🎯 <b>TP1 — {state.symbol}</b>\n+{pnl_pct:.1f}% | ربح: ${pnl_usd:.2f}", "trade_close"
         )
 
     async def _close_position(self, state: SlotState, price: float, reason: str):
@@ -1563,7 +1589,7 @@ class TradeMonitor:
         emoji = "🎯" if pnl_pct > 0 else "🛑"
         await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
             f"{emoji} <b>{'TP' if pnl_pct>0 else 'SL'} — {state.symbol}</b>\n"
-            f"{pnl_pct:+.1f}% | ${pnl_usd:+.2f} | سبب: {reason}"
+            f"{pnl_pct:+.1f}% | ${pnl_usd:+.2f} | سبب: {reason}", "trade_close"
         )
 
     async def _reconcile(self):
@@ -1662,16 +1688,19 @@ class AutoHeal:
                 sym   = f"{base}/USDT"
                 price = self.ex.live_price(sym)
                 val   = qty * price
-                # إذا كانت قيمة أقل من $0.50 — غبار → بيع فوري
-                if 0 < val < 0.50 and sym not in db_symbols and not self.slots.get(sym):
-                    try:
-                        prec_qty = float(self.ex.exchange.amount_to_precision(sym, qty * 0.99))
-                        if prec_qty > 0:
-                            self.ex.exchange.create_market_sell_order(sym, prec_qty)
-                            actions.append(f"🧹 {sym}: غبار (${val:.3f}) → بيع تلقائي")
-                            _log(f"[AutoHeal] 🧹 Dust sell {sym} qty={prec_qty:.6f} val=${val:.3f}")
-                    except Exception as de:
-                        _log(f"[AutoHeal] ⚠️ Dust sell {sym}: {de}")
+                # إذا كانت قيمة أقل من $1.50 — غبار → بيع فوري (إذا ≥ $1 للحد الأدنى)
+                if 0 < val < 1.50 and sym not in db_symbols and not self.slots.get(sym):
+                    if val >= 1.0:  # MEXC يشترط $1 كحد أدنى للبيع
+                        try:
+                            prec_qty = float(self.ex.exchange.amount_to_precision(sym, qty * 0.99))
+                            if prec_qty > 0:
+                                self.ex.exchange.create_market_sell_order(sym, prec_qty)
+                                actions.append(f"🧹 {sym}: غبار (${val:.2f}) → بيع تلقائي")
+                                _log(f"[AutoHeal] 🧹 Dust sell {sym} qty={prec_qty:.6f} val=${val:.2f}")
+                        except Exception as de:
+                            _log(f"[AutoHeal] ⚠️ Dust sell {sym}: {de}")
+                    else:
+                        _log(f"[AutoHeal] 🧹 {sym}: غبار (${val:.3f}) < $1 — لا يمكن بيعه (MEXC)")
                     continue
                 if val < cap_per_slot * 0.20:
                     continue
@@ -1738,8 +1767,8 @@ class Orchestrator:
         _log(f"[Capital] free=${free:.2f} invested=${invested:.2f} total=${total:.2f} per_slot=${result:.2f}")
         return result
 
-    async def _send_tg(self, text: str):
-        await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id, text)
+    async def _send_tg(self, text: str, msg_type: str = "misc"):
+        await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id, text, msg_type)
 
     async def _startup_notify(self):
         balance = self.ex.free_usdt()
@@ -1954,7 +1983,7 @@ class Orchestrator:
                 f"🎯 TP1: <code>{targets['tp1']:.6g}</code>\n"
                 f"🎯 TP2: <code>{targets['tp2']:.6g}</code>\n"
                 f"🛡 SL: <code>{targets['sl']:.6g}</code>\n"
-                f"🤖 AI: {ai_vote}"
+                f"🤖 AI: {ai_vote}", "trade_open"
             )
             _log(f"[Orchestrator] ✅ {signal['strategy']} {symbol} @ {price:.6g} [{signal_source}]")
 
@@ -2013,6 +2042,37 @@ class Orchestrator:
                     _log("[Scan] كل الـ slots مشغولة — انتظار")
                 elif balance < capital * 0.5 and self.slots.used == 0:
                     _log(f"[Scan] رصيد ${balance:.2f} منخفض جداً")
+                    # تنبيه للمستخدم بضرورة شحن الرصيد (مرة واحدة كل ساعة)
+                    now_ts = time.time()
+                    if now_ts - getattr(self, "_last_nofunds_alert", 0) > 3600:
+                        self._last_nofunds_alert = now_ts
+                        # فحص هل هناك فرص في السوق الآن
+                        try:
+                            safe_syms = [s for s in self.ex.SAFE_COINS
+                                        if s.replace("/USDT","") not in self.ex._geo_blocked]
+                            if safe_syms:
+                                tickers_nf = await asyncio.get_event_loop().run_in_executor(
+                                    None, self.ex.exchange.fetch_tickers, safe_syms[:5]
+                                )
+                                top_coin = max(
+                                    [(s, float(t.get("percentage") or 0))
+                                     for s, t in (tickers_nf or {}).items()
+                                     if float(t.get("percentage") or 0) > 0.5],
+                                    key=lambda x: x[1], default=None
+                                )
+                                if top_coin:
+                                    await self._send_tg(
+                                        f"⚠️ <b>فرصة ضائعة — رصيد منخفض</b>\n"
+                                        "━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"🚀 {top_coin[0]} +{top_coin[1]:.1f}% الآن\n"
+                                        f"💼 رصيد حر: <code>${balance:.2f}</code>\n"
+                                        f"📌 الحد الأدنى للصفقة: <code>${capital:.2f}</code>\n"
+                                        "━━━━━━━━━━━━━━━━━━━━\n"
+                                        "💡 يرجى شحن الرصيد للاستفادة من الفرص",
+                                        "alert_nofunds"
+                                    )
+                        except Exception as nf_e:
+                            _log(f"[NoFunds] ⚠️ {nf_e}")
                 else:
                     # 1. تحديث مصادر الإشارات (الأصلية + الجديدة)
                     try:
@@ -2136,7 +2196,7 @@ class Orchestrator:
                                             "━━━━━━━━━━━━━━━━━━━━\n"
                                             f"🎯 TP1: <code>{targets['tp1']:.6g}</code>\n"
                                             f"🎯 TP2: <code>{targets['tp2']:.6g}</code>\n"
-                                            f"🛡 SL: <code>{targets['sl']:.6g}</code>"
+                                            f"🛡 SL: <code>{targets['sl']:.6g}</code>", "trade_open"
                                         )
                                         _log(f"[SafeScan] ✅ صفقة ناجحة: {sym} @ {price_b:.6g}")
                                     else:
@@ -2206,14 +2266,7 @@ class Orchestrator:
                                 force_new_listing=True
                             )
 
-                # Smart Report
-                self._report_tick += self.cfg.scan_interval_min
-                if self._report_tick >= self.cfg.smart_report_hours * 60:
-                    self._report_tick = 0
-                    try:
-                        await self._smart_report(session)
-                    except Exception as e:
-                        _log(f"[Report] ⚠️ {e}")
+                # (Smart Report معطّل — إشعارات الصفقات فقط)
 
                 await asyncio.sleep(self.cfg.scan_interval_min * 60)
 
@@ -2251,20 +2304,8 @@ class Orchestrator:
         self.ex.SAFE_COINS = verified_safe
         _log(f"[Startup] 🛡️ SAFE_COINS المتاحة: {verified_safe}")
 
-        # إرسال إشعار البداية كـ background task (لا يعطل الـ scan)
-        async def _delayed_startup_notify():
-            _log("[TG] ⏳ انتظار 300ث قبل إشعار البداية...")
-            await asyncio.sleep(300)  # 5 دقائق لتجنب 429 عند restart متكرر
-            _log("[TG] 📤 إرسال إشعار البداية...")
-            await self._startup_notify()
-            if actions:
-                await asyncio.sleep(10)  # 10 ثانية بين الرسائل
-                await self._send_tg(
-                    "🔧 <b>Auto-Heal</b>\n" +
-                    "\n".join(f"  {a}" for a in actions)
-                )
-
-        asyncio.create_task(_delayed_startup_notify())
+        # لا إشعار عند البداية — فقط صفقات وتنبيهات مهمة
+        _log("[TG] ✅ Bot بدأ — إشعارات الصفقات فقط")
 
         monitor_task = asyncio.create_task(self.monitor.start())
         try:
