@@ -1655,12 +1655,24 @@ class AutoHeal:
                     except Exception as te:
                         _log(f"[AutoHeal] ❌ TP1 retry {sym}: {te}")
 
+            # تنظيف الغبار: بيع العملات الغبارية غير المسجلة
             for base, qty in freqd.items():
                 if base in ("USDT", "USDC"):
                     continue
                 sym   = f"{base}/USDT"
                 price = self.ex.live_price(sym)
                 val   = qty * price
+                # إذا كانت قيمة أقل من $0.50 — غبار → بيع فوري
+                if 0 < val < 0.50 and sym not in db_symbols and not self.slots.get(sym):
+                    try:
+                        prec_qty = float(self.ex.exchange.amount_to_precision(sym, qty * 0.99))
+                        if prec_qty > 0:
+                            self.ex.exchange.create_market_sell_order(sym, prec_qty)
+                            actions.append(f"🧹 {sym}: غبار (${val:.3f}) → بيع تلقائي")
+                            _log(f"[AutoHeal] 🧹 Dust sell {sym} qty={prec_qty:.6f} val=${val:.3f}")
+                    except Exception as de:
+                        _log(f"[AutoHeal] ⚠️ Dust sell {sym}: {de}")
+                    continue
                 if val < cap_per_slot * 0.20:
                     continue
                 if sym in db_symbols or self.slots.get(sym):
@@ -1686,8 +1698,11 @@ class AutoHeal:
     def _calc_capital(self) -> float:
         if self.cfg.capital > 0:
             return self.cfg.capital
+        # في AutoHeal: استخدام إجمالي الرصيد المقدر
         free = self.ex.free_usdt()
-        return max(1.0, round(free / max(1, self.cfg.max_slots), 2))
+        invested = sum(s.capital for s in self.slots.all())
+        total = free + invested
+        return max(1.0, round(total / max(1, self.cfg.max_slots), 2))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1714,8 +1729,14 @@ class Orchestrator:
     def _calc_capital(self) -> float:
         if self.cfg.capital > 0:
             return self.cfg.capital
+        # حساب إجمالي الرصيد = حر + مستثمر في الصفقات المفتوحة
         free = self.ex.free_usdt()
-        return max(1.0, round(free / max(1, self.cfg.max_slots), 2))
+        invested = sum(s.capital for s in self.slots.all())
+        total = free + invested
+        per_slot = total / max(1, self.cfg.max_slots)
+        result = max(1.0, round(per_slot, 2))
+        _log(f"[Capital] free=${free:.2f} invested=${invested:.2f} total=${total:.2f} per_slot=${result:.2f}")
+        return result
 
     async def _send_tg(self, text: str):
         await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id, text)
