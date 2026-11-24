@@ -1205,16 +1205,23 @@ class StrategyEngine:
         if not self.cfg.s3_enabled:
             return None
 
+        # شرط D: SAFE_COINS — عتبة مخففة جداً (1H gain >= 1%) لضمان وجود صفقة دائماً
+        _SAFE = {s.replace("/USDT","") for s in self.ex.SAFE_COINS}
+        base = symbol.replace("/USDT","")
+        is_safe = base in _SAFE
+
         # شرط C: سريع من الـ tickers المُخزنة (24H gain >= 10%)
         try:
             cached = self.ex._tickers_cache or {}
             t = cached.get(symbol, {})
             if t:
                 gain_24h = float(t.get("percentage") or t.get("change") or 0)
-                if gain_24h >= 10.0:
+                threshold = 3.0 if is_safe else 10.0  # عتبة مخففة للـ SAFE_COINS
+                if gain_24h >= threshold:
                     price = float(t.get("last") or t.get("close") or 0)
                     vol_usd = float(t.get("quoteVolume") or 0)
-                    if price > 0 and vol_usd >= self.cfg.min_volume_usd:
+                    min_vol = 500000 if is_safe else self.cfg.min_volume_usd  # حجم أدنى أعلى للـ SAFE_COINS
+                    if price > 0 and vol_usd >= min_vol:
                         _log(f"[S3🚀] {symbol} 24H={gain_24h:.1f}% vol=${vol_usd:.0f} — fast-track!")
                         return {"strategy": "S3", "rsi": 50, "gain_pct": gain_24h,
                                 "vol_ratio": 1.5, "price": price, "trigger": "24H"}
@@ -1238,11 +1245,13 @@ class StrategyEngine:
             return None
 
         # شرط A: ارتفاع سريع في ساعة
-        # gain_1h >= 3% مع أي حجم (حجم USD يُفحص لاحقاً بالـ ticker)
-        # gain_1h >= 5% → دخول فوري بدون شرط vol_ratio
+        # للـ SAFE_COINS: عتبة مخففة (1%) لضمان دخول دائم
+        # للـ altcoins: gain >= s3_gain_1h_min مع vol_ratio
         vol_ok_1h   = vol_ratio >= self.cfg.s3_vol_spike
         strong_gain = gain_1h >= (self.cfg.s3_gain_1h_min + 2.0)  # 5%
-        if gain_1h >= self.cfg.s3_gain_1h_min and (vol_ok_1h or strong_gain):
+        gain_min = 1.0 if is_safe else self.cfg.s3_gain_1h_min
+        vol_ok_safe = True if is_safe else (vol_ok_1h or strong_gain)
+        if gain_1h >= gain_min and vol_ok_safe:
             _log(f"[S3] ✅ {symbol} 1H gain={gain_1h:.1f}% vol={vol_ratio:.1f}x RSI={rsi:.0f}")
             return {"strategy": "S3", "rsi": rsi, "gain_pct": gain_1h,
                     "vol_ratio": vol_ratio, "price": price, "trigger": "1H"}
@@ -1889,25 +1898,6 @@ class Orchestrator:
             scan_count    = 0
             new_listings_check_tick = 0
 
-            # اختبار أولي: هل يمكن تداول BTC من هذا IP؟
-            _log("[GeoTest] 🧪 اختبار هل BTC/USDT قابل للتداول من هذا الـ IP...")
-            try:
-                test_order = self.ex.exchange.create_market_buy_order(
-                    "BTC/USDT",
-                    self.ex.exchange.amount_to_precision("BTC/USDT", 0.00001)
-                )
-                _log(f"[GeoTest] ✅ BTC/USDT قابل للتداول! order={test_order.get('id','?')}")
-                # إلغاء الاختبار فوراً إذا نجح (لا نريد شراء حقيقي)
-            except Exception as geo_err:
-                geo_msg = str(geo_err)
-                if "11444" in geo_msg:
-                    _log("[GeoTest] ⛔ BTC/USDT محجوب جغرافياً (11444) — حتى BTC مرفوض من هذا IP!")
-                elif "InsufficientFunds" in geo_msg or "insufficient" in geo_msg.lower():
-                    _log("[GeoTest] ✅ BTC/USDT متاح — رُفض لرصيد غير كافٍ (طبيعي للاختبار)")
-                elif "Invalid order" in geo_msg or "min" in geo_msg.lower():
-                    _log(f"[GeoTest] ✅ BTC/USDT متاح — رُفض لحجم صغير جداً: {geo_err}")
-                else:
-                    _log(f"[GeoTest] ⚠️ BTC/USDT: {geo_err}")
 
             while True:
                 scan_count += 1
