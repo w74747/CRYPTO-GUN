@@ -1974,19 +1974,30 @@ class Orchestrator:
                     if self.slots.free > 0:
                         _log("[SafeScan] 🛡️ فحص SAFE_COINS أولاً...")
                         try:
-                            cached = self.ex._tickers_cache or {}
+                            # جلب tickers مباشر لـ SAFE_COINS (لا نعتمد على cache)
+                            safe_symbols = [s for s in self.ex.SAFE_COINS
+                                           if s.replace("/USDT","") not in self.ex._geo_blocked
+                                           and self.slots.is_vacant(s)]
+                            live_tickers = {}
+                            if safe_symbols:
+                                try:
+                                    fetched = await asyncio.get_event_loop().run_in_executor(
+                                        None, self.ex.exchange.fetch_tickers, safe_symbols
+                                    )
+                                    live_tickers = fetched or {}
+                                except Exception as et:
+                                    _log(f"[SafeScan] ⚠️ fetch_tickers: {et}")
+                                    # fallback للـ cache
+                                    live_tickers = self.ex._tickers_cache or {}
+
                             safe_candidates = []
-                            for sym in self.ex.SAFE_COINS:
-                                base = sym.replace("/USDT","")
-                                if base in self.ex._geo_blocked:
-                                    continue
-                                if not self.slots.is_vacant(sym):
-                                    continue
-                                t = cached.get(sym, {})
+                            for sym in safe_symbols:
+                                t = live_tickers.get(sym, {})
                                 pct = float(t.get("percentage") or t.get("change") or 0)
                                 vol_usd = float(t.get("quoteVolume") or 0)
                                 price_s = float(t.get("last") or t.get("close") or 0)
-                                if pct > 0 and vol_usd > 100000 and price_s > 0:
+                                _log(f"[SafeScan] {sym}: pct={pct:.2f}% vol=${vol_usd:.0f} price={price_s:.6g}")
+                                if pct > 0.1 and vol_usd > 50000 and price_s > 0:
                                     safe_candidates.append((sym, pct, price_s))
                             safe_candidates.sort(key=lambda x: x[1], reverse=True)
                             if safe_candidates:
@@ -2042,7 +2053,7 @@ class Orchestrator:
                                     else:
                                         _log(f"[SafeScan] ❌ فشل شراء {sym}")
                             else:
-                                _log("[SafeScan] ℹ️ لا SAFE_COIN بـ gain إيجابي الآن")
+                                _log(f"[SafeScan] ℹ️ لا SAFE_COIN بـ gain >0.1% الآن (فحص {len(safe_symbols)} عملة)")
                         except Exception as e:
                             _log(f"[SafeScan] ⚠️ {e}")
 
