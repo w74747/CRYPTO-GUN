@@ -524,11 +524,13 @@ class Executor:
         return False
 
     def fetch_coin_balance_usdt(self, symbol: str, price: float) -> float:
-        """يجلب القيمة الفعلية للعملة على البورصة بالدولار"""
+        """يجلب القيمة الفعلية للعملة على البورصة بالدولار (free + used)"""
         try:
             base = symbol.replace("/USDT", "")
             bal = self.exchange.fetch_balance({"type": "spot"})
-            qty = float(bal.get(base, {}).get("free", 0)) + float(bal.get(base, {}).get("used", 0))
+            free = float(bal.get(base, {}).get("free", 0))
+            used = float(bal.get(base, {}).get("used", 0))
+            qty  = free + used  # used = محجوز في أوردرات TP مفتوحة
             return qty * price
         except Exception:
             return -1  # -1 = فشل الجلب، لا نعامله كغبار
@@ -1615,11 +1617,27 @@ class TradeMonitor:
         if price <= 0:
             return
 
-        # ── تحقق من الغبار قبل أي شيء ──
+        # ── تحقق من الغبار قبل أي شيء — لكن لا تُغلق إذا كان هناك أوردر TP مفتوح ──
         qty = state.remaining_qty if state.remaining_qty > 0 else state.filled_qty
-        val = qty * price
-        if val < 1.0 and qty > 0:
-            _log(f"[Monitor] 🧹 {state.symbol} غبار (val=${val:.4f} < $1) → إغلاق تلقائي")
+        # إذا كان هناك TP1 order مفتوح → لا تُغلق بسبب الغبار (الكمية محجوزة في "used")
+        if state.tp1_order_id:
+            # تحقق أن الأوردر لا يزال مفتوحاً فعلاً
+            try:
+                tp1_status = await asyncio.get_event_loop().run_in_executor(
+                    None, self.ex.order_status, state.symbol, state.tp1_order_id
+                )
+                if tp1_status in ("open", "partially_filled"):
+                    # الكمية محجوزة بالأوردر — استخدم filled_qty للحساب
+                    qty = state.filled_qty
+            except Exception:
+                pass
+        actual_val = await asyncio.get_event_loop().run_in_executor(
+            None, self.ex.fetch_coin_balance_usdt, state.symbol, price
+        )
+        # استخدم الرصيد الفعلي (free+used) إذا كان متاحاً، وإلا استخدم qty من الذاكرة
+        check_val = actual_val if actual_val >= 0 else (qty * price)
+        if check_val < 1.0 and qty > 0 and not state.tp1_order_id:
+            _log(f"[Monitor] 🧹 {state.symbol} غبار (val=${check_val:.4f} < $1) → إغلاق تلقائي")
             if state.db_trade_id:
                 pnl_pct_d = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
                 pnl_usd_d = (price - state.entry_price) * qty if state.entry_price else 0
@@ -1834,19 +1852,37 @@ class AutoHeal:
             db_trades    = self.db.get_open_trades()
             cap_per_slot = self._calc_capital()
             bal          = self.ex.exchange.fetch_balance({"type": "spot"})
-            freqd        = {k: float(v.get("free", 0))
+            # free + used: يشمل الكميات المقيدة بأوردرات TP مفتوحة
+            freqd        = {k: float(v.get("free", 0)) + float(v.get("used", 0))
                             for k, v in bal.items()
-                            if isinstance(v, dict) and float(v.get("free", 0)) > 0}
+                            if isinstance(v, dict) and
+                            (float(v.get("free", 0)) + float(v.get("used", 0))) > 0}
             db_symbols   = {t["symbol"] for t in db_trades}
 
             for t in db_trades:
                 sym   = t["symbol"]
                 base  = sym.replace("/USDT", "")
                 price = self.ex.live_price(sym)
-                qty   = freqd.get(base, 0)
+                # ✅ استخدم free + used (الكميات المقيدة بأوردرات مفتوحة)
+                free_qty = float(bal.get(base, {}).get("free", 0))
+                used_qty = float(bal.get(base, {}).get("used", 0))
+                qty   = free_qty + used_qty
                 val   = qty * price
 
-                if val < cap_per_slot * 0.15:
+                # ✅ إذا كان هناك أوردر TP1 مفتوح على البورصة → لا تُغلق الصفقة أبداً
+                tp1_id = t.get("tp1_order_id", "") or ""
+                if tp1_id:
+                    try:
+                        status = self.ex.order_status(sym, tp1_id)
+                        if status in ("open", "partially_filled"):
+                            _log(f"[AutoHeal] ✋ {sym}: أوردر TP1 مفتوح ({tp1_id[:8]}) → لا تُغلق")
+                            # استمر في استرجاع الصفقة بغض النظر عن الكمية
+                            qty = max(qty, float(t.get("filled_qty", 0)))
+                            val = qty * price
+                    except Exception:
+                        pass
+
+                if val < cap_per_slot * 0.15 and not tp1_id:
                     self.db.close_trade(t["id"], price or float(t.get("entry_price", 0)),
                                         0, "heal_dust", 0, 0)
                     actions.append(f"🧹 {sym}: أتربة (${val:.2f}) → أُغلق")
