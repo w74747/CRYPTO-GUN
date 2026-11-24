@@ -359,7 +359,8 @@ class SlotState:
     partial1_done: bool          = False
     partial2_done: bool          = False
     remaining_qty: float         = 0.0
-    atr_pct:       float         = 0.0   # ATR% عند فتح الصفقة (للـ trailing)
+    atr_pct:            float         = 0.0   # ATR% عند فتح الصفقة (للـ trailing)
+    last_target_review: float         = 0.0   # آخر وقت مراجعة الأهداف (unix timestamp)
 
 
 class SlotManager:
@@ -1692,6 +1693,135 @@ class TradeMonitor:
             _log(f"[Monitor] 🎯 TP1 سعر {state.symbol}")
             await self._on_tp1_filled(state, price)
             return
+
+        # ── مراجعة دورية للأهداف كل 15 دقيقة ──
+        await self._periodic_target_review(state, price)
+
+    async def _periodic_target_review(self, state: SlotState, price: float):
+        """
+        مراجعة مستمرة للأهداف كل 15 دقيقة:
+        - يُعيد حساب ATR من بيانات حية
+        - يرفع SL إذا تحرّك السعر لصالحنا
+        - يُعيد حساب TP1 إذا أصبح بعيداً جداً أو قريباً جداً
+        - لا يُخفض SL أبداً
+        """
+        REVIEW_INTERVAL = 900  # 15 دقيقة
+        now = time.time()
+        if now - state.last_target_review < REVIEW_INTERVAL:
+            return
+
+        # لا نراجع الأهداف بعد تحقيق TP1 (المرحلة الثانية يتولاها trailing)
+        if state.partial1_done:
+            self.slots.update(state.symbol, last_target_review=now)
+            return
+
+        sym = state.symbol
+        old_sl  = state.sl_price
+        old_tp1 = state.tp1_price
+
+        try:
+            # ── حساب ATR من OHLCV حية ──
+            atr_pct = 0.0
+            try:
+                df = await asyncio.get_event_loop().run_in_executor(
+                    None, self.ex.fetch_ohlcv, sym, "1h", 50
+                )
+                if df is not None and len(df) >= 10:
+                    hi = df["high"].values
+                    lo = df["low"].values
+                    cl = df["close"].values
+                    tr = [max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
+                          for i in range(1, len(cl))]
+                    atr = sum(tr[-14:]) / min(14, len(tr))
+                    atr_pct = round((atr / cl[-1]) * 100, 3)
+            except Exception:
+                pass
+            if atr_pct <= 0:
+                atr_pct = 2.5
+
+            sl_pct      = max(1.5, min(6.0, atr_pct * 1.2))
+            tp1_pct_min = sl_pct * 2.0  # RR 2:1 الحد الأدنى
+
+            new_sl  = old_sl
+            new_tp1 = old_tp1
+            note    = "لا تغيير"
+
+            # ─── إذا كان هناك TP1 order مفتوح على البورصة ───
+            if state.tp1_order_id:
+                # فقط تحقق من صحة SL — ولا تُغيّر TP1
+                # إذا السعر ارتفع كثيراً فوق نقطة الدخول → ارفع SL للتعادل
+                if price >= state.entry_price * 1.015 and old_sl < state.entry_price:
+                    breakeven = state.entry_price * 1.001
+                    new_sl = max(old_sl, breakeven)
+                    note = f"SL رُفع للتعادل {new_sl:.6g} (TP1 order مفتوح)"
+                else:
+                    self.slots.update(sym, last_target_review=now)
+                    return
+
+            # ─── TP1 تم تحقيقه فعلاً (سعر تجاوز TP1) ───
+            elif old_tp1 > 0 and price >= old_tp1 * 0.98:
+                new_sl = max(old_sl, state.entry_price * 1.001)
+                note = f"✅ TP1 مُحقَّق → SL رُفع للتعادل {new_sl:.6g}"
+
+            # ─── TP1 لا يزال أمامنا ───
+            elif old_tp1 > 0:
+                tp1_dist_pct = (old_tp1 - price) / price * 100
+
+                if tp1_dist_pct > atr_pct * 3.5:
+                    # TP1 بعيد جداً (> 3.5× ATR) → أعد حسابه
+                    new_tp1_pct = max(tp1_pct_min, atr_pct * 1.5)
+                    new_tp1_pct = min(new_tp1_pct, 15.0)
+                    new_tp1 = price * (1 + new_tp1_pct / 100)
+                    candidate_sl = price * (1 - sl_pct / 100)
+                    candidate_sl = min(candidate_sl, state.entry_price * 0.99)
+                    new_sl = max(old_sl, candidate_sl)
+                    note = f"♻️ TP1 بعيد ({tp1_dist_pct:.1f}%) → أُعيد: {new_tp1:.6g}"
+
+                elif tp1_dist_pct < atr_pct * 0.5:
+                    # TP1 قريب جداً (< 0.5× ATR) → وسّع قليلاً
+                    new_tp1_pct = max(tp1_pct_min, atr_pct * 1.2)
+                    new_tp1 = price * (1 + new_tp1_pct / 100)
+                    new_sl = max(old_sl, old_sl)  # احتفظ بـ SL
+                    note = f"🔼 TP1 قريب جداً → وُسِّع إلى {new_tp1:.6g}"
+
+                else:
+                    # TP1 معقول → تحقق فقط هل يمكن رفع SL
+                    if price > state.entry_price * 1.02:
+                        # السعر ارتفع +2% → حرّك SL للتعادل
+                        breakeven = state.entry_price * 1.001
+                        new_sl = max(old_sl, breakeven)
+                        if new_sl > old_sl:
+                            note = f"🛡 SL رُفع للتعادل {new_sl:.6g}"
+                        else:
+                            note = f"TP1={old_tp1:.6g} معقول ({tp1_dist_pct:.1f}% متبقٍ)"
+                    else:
+                        note = f"TP1={old_tp1:.6g} معقول ({tp1_dist_pct:.1f}% متبقٍ)"
+
+            # ── تطبيق التغييرات إذا وُجدت ──
+            sl_changed  = abs(new_sl  - old_sl)  > old_sl  * 0.001
+            tp1_changed = abs(new_tp1 - old_tp1) > old_tp1 * 0.001
+
+            if sl_changed or tp1_changed:
+                self.slots.update(sym, sl_price=new_sl, tp1_price=new_tp1, last_target_review=now)
+                if state.db_trade_id:
+                    self.db.update_targets(state.db_trade_id, new_sl, new_tp1)
+                _log(f"[Monitor] 🎯 {sym} مراجعة أهداف: ATR={atr_pct:.2f}% | "
+                     f"SL:{old_sl:.6g}→{new_sl:.6g} | TP1:{old_tp1:.6g}→{new_tp1:.6g} | {note}")
+                await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
+                    f"🎯 <b>مراجعة أهداف — {sym}</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 ATR = {atr_pct:.2f}%\n"
+                    f"🛡 SL : <code>{old_sl:.6g}</code> → <code>{new_sl:.6g}</code>\n"
+                    f"🏹 TP1: <code>{old_tp1:.6g}</code> → <code>{new_tp1:.6g}</code>\n"
+                    f"📝 {note}", "review"
+                )
+            else:
+                _log(f"[Monitor] 🔍 {sym} مراجعة أهداف: {note} (ATR={atr_pct:.2f}%)")
+                self.slots.update(sym, last_target_review=now)
+
+        except Exception as e:
+            _log(f"[Monitor] ⚠️ مراجعة أهداف {sym}: {e}")
+            self.slots.update(sym, last_target_review=now)
 
     async def _handle_s3_partials(self, state: SlotState, price: float, pnl_pct: float):
         """
