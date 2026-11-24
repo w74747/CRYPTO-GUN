@@ -514,17 +514,13 @@ class Executor:
             return None
 
     # عملات كبيرة مضمونة التداول على MEXC (لا تُحجب جغرافياً)
+    # العملات المضمونة فعلياً من Railway IP — فقط العملات الكبيرة جداً (top 10 عالمياً)
+    # تم تقليصها بناءً على اختبار مباشر: SAND/OP/NEAR/1INCH/ALGO كلها محجوبة أيضاً
     SAFE_COINS = [
         "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
-        "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT", "LINK/USDT",
-        "MATIC/USDT", "LTC/USDT", "ATOM/USDT", "UNI/USDT", "NEAR/USDT",
-        "FIL/USDT", "ARB/USDT", "OP/USDT", "INJ/USDT", "SUI/USDT",
-        "APT/USDT", "TIA/USDT", "JUP/USDT", "WIF/USDT", "BONK/USDT",
-        "PEPE/USDT", "SHIB/USDT", "FLOKI/USDT", "FTM/USDT", "ALGO/USDT",
-        "SAND/USDT", "MANA/USDT", "ENJ/USDT", "GALA/USDT", "CHZ/USDT",
-        "HBAR/USDT", "VET/USDT", "EOS/USDT", "TRX/USDT", "XLM/USDT",
-        "CRO/USDT", "CAKE/USDT", "AAVE/USDT", "MKR/USDT", "COMP/USDT",
-        "SNX/USDT", "CRV/USDT", "1INCH/USDT", "SUSHI/USDT", "YFI/USDT",
+        "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LTC/USDT", "TRX/USDT",
+        "DOT/USDT", "LINK/USDT", "SHIB/USDT", "PEPE/USDT", "BONK/USDT",
+        "WIF/USDT", "FLOKI/USDT", "SUI/USDT",
     ]
 
     def fetch_top_gainers(self, count: int = 50, min_pct: float = 3.0) -> list[str]:
@@ -2128,6 +2124,32 @@ class Orchestrator:
 
         healer  = AutoHeal(self.cfg, self.ex, self.slots, self.db)
         actions = healer.run()
+
+        # اختبار SAFE_COINS عند البدء لاكتشاف المحجوب منها
+        _log("[Startup] 🧪 اختبار SAFE_COINS من Railway IP...")
+        verified_safe = []
+        for sym in list(self.ex.SAFE_COINS):
+            base = sym.replace("/USDT", "")
+            try:
+                # fetch_order_book بدلاً من شراء حقيقي
+                ob = self.ex.exchange.fetch_order_book(sym, limit=1)
+                if ob and ob.get("asks"):
+                    verified_safe.append(sym)
+                    _log(f"[Startup] ✅ {sym} متاح")
+                else:
+                    self.ex._geo_blocked.add(base)
+                    _log(f"[Startup] ⛔ {sym} محجوب — أُضيف للـ blacklist")
+            except Exception as e:
+                err = str(e)
+                if "11444" in err or "70015" in err or "10007" in err:
+                    self.ex._geo_blocked.add(base)
+                    _log(f"[Startup] ⛔ {sym} محجوب ({err[:60]})")
+                else:
+                    verified_safe.append(sym)  # خطأ آخر، لا نحذفه
+                    _log(f"[Startup] ⚠️ {sym} خطأ غير حجب: {err[:60]}")
+        # تحديث SAFE_COINS بالمتاح فقط
+        self.ex.SAFE_COINS = verified_safe
+        _log(f"[Startup] 🛡️ SAFE_COINS المتاحة: {verified_safe}")
 
         # إرسال إشعار البداية كـ background task (لا يعطل الـ scan)
         async def _delayed_startup_notify():
