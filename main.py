@@ -285,6 +285,13 @@ class TradeDB:
     def update_tp1_order_id(self, trade_id: int, tp1_order_id: str):
         self.execute("UPDATE trades SET tp1_order_id=%s WHERE id=%s", (tp1_order_id, trade_id))
 
+    def update_targets(self, trade_id: int, sl_price: float, tp1_price: float):
+        """تحديث أهداف SL/TP1 للصفقة (مراجعة AutoHeal)"""
+        self.execute(
+            "UPDATE trades SET sl_price=%s, tp1_price=%s WHERE id=%s",
+            (sl_price, tp1_price, trade_id)
+        )
+
     def get_open_trades(self) -> list:
         rows = self.execute(
             "SELECT * FROM trades WHERE closed_at IS NULL ORDER BY opened_at",
@@ -1890,21 +1897,37 @@ class AutoHeal:
 
                 sl    = float(t.get("sl_price", 0))
                 entry = float(t.get("entry_price", 0))
+                tp1   = float(t.get("tp1_price", 0))
                 if sl <= 0 and entry > 0:
                     sl = entry * (1 - self.cfg.s1_sl_pct / 100)
+
+                # ── مراجعة الأهداف: هل لا تزال منطقية؟ ──
+                review = self._review_targets(sym, entry, price, sl, tp1,
+                                              t.get("strategy", "S3"), tp1_id)
+                if review["sl"] != sl or review["tp1"] != tp1:
+                    _log(f"[AutoHeal] 🎯 {sym}: تعديل أهداف — {review['note']}")
+                    sl  = review["sl"]
+                    tp1 = review["tp1"]
+                    # حفظ الأهداف المُحدَّثة في DB
+                    try:
+                        self.db.update_targets(t["id"], sl, tp1)
+                    except Exception:
+                        pass  # update_targets ستُضاف لاحقاً إذا لزم
+                else:
+                    _log(f"[AutoHeal] 🎯 {sym}: {review['note']}")
 
                 state = SlotState(
                     symbol=sym, strategy=t.get("strategy", "S1"),
                     signal_source=t.get("signal_source", "scan"),
                     entry_price=entry, filled_qty=float(t.get("filled_qty", qty)),
                     remaining_qty=qty, capital=float(t.get("capital_usd", cap_per_slot)),
-                    sl_price=sl, tp1_price=float(t.get("tp1_price", 0)),
+                    sl_price=sl, tp1_price=tp1,
                     tp2_price=float(t.get("tp2_price", 0)), tp3_price=float(t.get("tp3_price", 0)),
                     tp1_order_id=t.get("tp1_order_id", "") or "",
                     db_trade_id=t["id"], highest_price=price,
                 )
                 self.slots.occupy(state)
-                actions.append(f"♻️ {sym}: استُرجع (${val:.2f} @ SL={sl:.6g})")
+                actions.append(f"♻️ {sym}: استُرجع (${val:.2f} @ SL={sl:.6g} TP1={tp1:.6g})")
 
                 # إعادة وضع TP1 order إذا لم يكن موجوداً
                 tp1_id = t.get("tp1_order_id", "") or ""
@@ -1965,6 +1988,88 @@ class AutoHeal:
         except Exception as e:
             _log(f"[AutoHeal] ❌ {e}")
         return actions
+
+    def _review_targets(self, sym: str, entry: float, current_price: float,
+                         old_sl: float, old_tp1: float, strategy: str, tp1_id: str) -> dict:
+        """
+        يُعيد تقييم أهداف الصفقة المستعادة:
+        - يحسب ATR الحالي من بيانات حديثة
+        - إذا كان TP1 مُحقَّقاً فعلاً → يُعدّل SL للتعادل (breakeven)
+        - إذا كان TP1 لا يزال قابلاً للتحقيق → يحتفظ به أو يُعدّله
+        - إذا كان TP1 بعيداً جداً عن الواقع → يُعيد حسابه
+        يُعيد: {sl, tp1, note}
+        """
+        try:
+            from main import Strategy  # استخدام Strategy.calc_targets
+        except Exception:
+            pass
+
+        result = {"sl": old_sl, "tp1": old_tp1, "note": "unchanged"}
+
+        try:
+            # حساب ATR الحالي من OHLCV
+            atr_pct = 0.0
+            try:
+                df = self.ex.fetch_ohlcv(sym, "1h", 50)
+                if df is not None and len(df) >= 10:
+                    hi, lo, cl = df["high"].values, df["low"].values, df["close"].values
+                    tr = [max(hi[i]-lo[i], abs(hi[i]-cl[i-1]), abs(lo[i]-cl[i-1]))
+                          for i in range(1, len(cl))]
+                    atr = sum(tr[-14:]) / min(14, len(tr))
+                    atr_pct = round((atr / cl[-1]) * 100, 3)
+            except Exception:
+                pass
+            if atr_pct <= 0:
+                atr_pct = 2.5
+
+            sl_pct  = max(1.5, min(6.0, atr_pct * 1.2))
+            tp1_pct_min = sl_pct * 2.0  # RR 2:1
+
+            # ─── حالة 1: TP1 order مفتوح على البورصة → لا تُغيّر tp1
+            if tp1_id:
+                # فقط تحقق أن SL لا يزال منطقياً (لم ينهار السعر)
+                if old_sl > 0 and current_price < old_sl * 1.02:
+                    # السعر قرب SL أو تحته → SL قديم ولا يزال صالح، لا تحرك
+                    result["note"] = f"TP1 order مفتوح، SL={old_sl:.6g} صالح"
+                return result
+
+            # ─── حالة 2: TP1 تم تحقيقه (current_price > old_tp1) → رفع SL للتعادل
+            if old_tp1 > 0 and current_price >= old_tp1 * 0.98:
+                new_sl = entry * 1.001  # breakeven + 0.1%
+                result["sl"]   = new_sl
+                result["tp1"]  = old_tp1  # احتفظ بـ TP1 الأصلي
+                result["note"] = f"✅ TP1 مُحقَّق → SL رُفع للتعادل {new_sl:.6g}"
+                return result
+
+            # ─── حالة 3: TP1 لا يزال أمامنا — هل هو قابل للتحقيق؟
+            if old_tp1 > 0:
+                tp1_dist_pct = (old_tp1 - current_price) / current_price * 100
+                # إذا بعيد جداً (> 3× ATR) → أعد حسابه بناءً على ATR الحالي
+                if tp1_dist_pct > atr_pct * 3:
+                    new_tp1_pct = max(tp1_pct_min, atr_pct * 1.5)
+                    new_tp1 = current_price * (1 + new_tp1_pct / 100)
+                    new_sl  = current_price * (1 - sl_pct / 100)
+                    # لكن لا نرفع SL فوق نقطة الدخول إذا لم نحقق TP بعد
+                    new_sl = min(new_sl, entry * 0.99)
+                    result["sl"]   = max(old_sl, new_sl)  # لا نخفض SL أبداً
+                    result["tp1"]  = new_tp1
+                    result["note"] = f"♻️ TP1 بعيد ({tp1_dist_pct:.1f}%) → أُعيد حسابه: {new_tp1:.6g}"
+                    return result
+
+                # TP1 معقول → احتفظ بالأهداف القديمة، فقط تحقق من SL
+                if old_sl > 0:
+                    # لا تخفض SL إذا كان منطقياً
+                    min_sl = current_price * (1 - sl_pct / 100)
+                    if old_sl < min_sl * 0.5:  # SL قديم متدنٍ جداً → رفعه قليلاً
+                        result["sl"]   = min_sl
+                        result["note"] = f"SL رُفع من {old_sl:.6g} إلى {min_sl:.6g}"
+                    else:
+                        result["note"] = f"TP1={old_tp1:.6g} قابل للتحقيق ({tp1_dist_pct:.1f}% متبقٍ)"
+
+        except Exception as e:
+            _log(f"[AutoHeal] ⚠️ _review_targets {sym}: {e}")
+
+        return result
 
     def _calc_capital(self) -> float:
         if self.cfg.capital > 0:
