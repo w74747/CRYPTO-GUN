@@ -739,6 +739,13 @@ class AIAdvisor:
 # TELEGRAM
 # ══════════════════════════════════════════════════════════════
 _tg_last_sent: float = 0.0  # وقت آخر رسالة ناجحة
+_tg_lock: asyncio.Lock = None  # global lock لمنع الإرسال المتزامن
+
+def _get_tg_lock():
+    global _tg_lock
+    if _tg_lock is None:
+        _tg_lock = asyncio.Lock()
+    return _tg_lock
 
 async def tg_send(token: str, chat_id: str, text: str):
     global _tg_last_sent
@@ -749,7 +756,14 @@ async def tg_send(token: str, chat_id: str, text: str):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
 
-    for attempt in range(8):
+    # انتظار فترة بين الرسائل لتجنب 429
+    async with _get_tg_lock():
+        now = asyncio.get_event_loop().time()
+        elapsed = now - _tg_last_sent
+        if elapsed < 2.0:  # حد أدنى ثانيتين بين الرسائل
+            await asyncio.sleep(2.0 - elapsed)
+
+    for attempt in range(3):  # 3 محاولات بدل 8
         try:
             conn = aiohttp.TCPConnector(ssl=True, limit=3, force_close=True)
             async with aiohttp.ClientSession(connector=conn) as s:
@@ -2164,12 +2178,12 @@ class Orchestrator:
 
         # إرسال إشعار البداية كـ background task (لا يعطل الـ scan)
         async def _delayed_startup_notify():
-            _log("[TG] ⏳ انتظار 120ث قبل إشعار البداية...")
-            await asyncio.sleep(120)
+            _log("[TG] ⏳ انتظار 180ث قبل إشعار البداية...")
+            await asyncio.sleep(180)  # انتظار 3 دقائق بدل 2 لتجنب 429 عند restart
             _log("[TG] 📤 إرسال إشعار البداية...")
             await self._startup_notify()
             if actions:
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)  # 10 ثانية بين الرسائل
                 await self._send_tg(
                     "🔧 <b>Auto-Heal</b>\n" +
                     "\n".join(f"  {a}" for a in actions)
