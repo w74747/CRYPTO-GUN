@@ -513,10 +513,24 @@ class Executor:
         except Exception:
             return None
 
+    # عملات كبيرة مضمونة التداول على MEXC (لا تُحجب جغرافياً)
+    SAFE_COINS = [
+        "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+        "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "DOT/USDT", "LINK/USDT",
+        "MATIC/USDT", "LTC/USDT", "ATOM/USDT", "UNI/USDT", "NEAR/USDT",
+        "FIL/USDT", "ARB/USDT", "OP/USDT", "INJ/USDT", "SUI/USDT",
+        "APT/USDT", "TIA/USDT", "JUP/USDT", "WIF/USDT", "BONK/USDT",
+        "PEPE/USDT", "SHIB/USDT", "FLOKI/USDT", "FTM/USDT", "ALGO/USDT",
+        "SAND/USDT", "MANA/USDT", "ENJ/USDT", "GALA/USDT", "CHZ/USDT",
+        "HBAR/USDT", "VET/USDT", "EOS/USDT", "TRX/USDT", "XLM/USDT",
+        "CRO/USDT", "CAKE/USDT", "AAVE/USDT", "MKR/USDT", "COMP/USDT",
+        "SNX/USDT", "CRV/USDT", "1INCH/USDT", "SUSHI/USDT", "YFI/USDT",
+    ]
+
     def fetch_top_gainers(self, count: int = 50, min_pct: float = 3.0) -> list[str]:
         """
         يجلب أفضل N رابح من MEXC مباشرة.
-        أسرع بكثير من فحص 3000 عملة!
+        يُضيف SAFE_COINS كـ fallback إذا كانت الـ altcoins محجوبة.
         """
         # Tokenized stocks — محجوبة في معظم الدول
         _TOKENIZED_SUFFIXES = ("ON", "STOCK", "X")  # NVDAON, JNJSTOCK, NVDAX
@@ -534,17 +548,28 @@ class Executor:
                     continue
                 if _is_tokenized(symbol):
                     continue  # تخطي Tokenized Stocks
+                # تخطي العملات المحجوبة مسبقاً
+                base = symbol.replace("/USDT", "")
+                if base in self._geo_blocked:
+                    continue
                 pct = float(t.get("percentage") or t.get("change") or 0)
                 vol_usd = float(t.get("quoteVolume") or 0)
                 if pct >= min_pct and vol_usd > 50000:
                     gainers.append((symbol, pct, vol_usd))
             gainers.sort(key=lambda x: x[1], reverse=True)
             top = [g[0] for g in gainers[:count]]
-            _log(f"[TopGainers] 🏆 وجدت {len(top)} رابح (أعلى: {gainers[0][1]:.1f}% {gainers[0][0] if gainers else ''})")
-            return top
+            if top:
+                _log(f"[TopGainers] 🏆 وجدت {len(top)} رابح (أعلى: {gainers[0][1]:.1f}% {gainers[0][0]})")
+            else:
+                _log(f"[TopGainers] ⚠️ لا رابح — سأفحص SAFE_COINS")
+
+            # دائماً أضف SAFE_COINS للبحث (بشرط ألا تكون محجوبة)
+            safe = [s for s in self.SAFE_COINS if s.replace("/USDT","") not in self._geo_blocked]
+            combined = top + [s for s in safe if s not in top]
+            return combined[:count + len(safe)]
         except Exception as e:
             _log(f"[TopGainers] ❌ {e}")
-            return []
+            return list(self.SAFE_COINS)
 
     def fetch_volume_anomalies(self, spike_ratio: float = 5.0) -> list[str]:
         """
