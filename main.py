@@ -1363,31 +1363,115 @@ class StrategyEngine:
         except Exception:
             return None
 
+    def _calc_atr(self, symbol: str, tf: str = "1h", limit: int = 14) -> float:
+        """حساب ATR (متوسط التذبذب الحقيقي) لتحديد المسافة المثلى للأهداف"""
+        try:
+            df = self.ex.fetch_ohlcv(symbol, tf, limit=limit + 1)
+            if df is None or len(df) < 5:
+                return 0.0
+            hi = df["high"].values
+            lo = df["low"].values
+            cl = df["close"].values
+            tr = [max(hi[i] - lo[i],
+                      abs(hi[i] - cl[i-1]),
+                      abs(lo[i] - cl[i-1]))
+                  for i in range(1, len(df))]
+            atr = sum(tr[-14:]) / min(14, len(tr))
+            atr_pct = (atr / cl[-1]) * 100
+            return round(atr_pct, 3)
+        except Exception as e:
+            _log(f"[ATR] ⚠️ {symbol}: {e}")
+            return 0.0
+
+    def _calc_support_resistance(self, symbol: str) -> tuple[float, float]:
+        """أقرب دعم ومقاومة من بيانات 4H"""
+        try:
+            df = self.ex.fetch_ohlcv(symbol, "4h", limit=24)
+            if df is None or len(df) < 5:
+                return 0.0, 0.0
+            price = df["close"].iloc[-1]
+            lows  = df["low"].values
+            highs = df["high"].values
+            # أقرب دعم (أعلى قاع تحت السعر الحالي)
+            supports = sorted([l for l in lows if l < price], reverse=True)
+            support  = supports[0] if supports else price * 0.97
+            # أقرب مقاومة (أدنى قمة فوق السعر الحالي)
+            resists  = sorted([h for h in highs if h > price])
+            resist   = resists[0] if resists else price * 1.05
+            return support, resist
+        except Exception as e:
+            _log(f"[S/R] ⚠️ {symbol}: {e}")
+            return 0.0, 0.0
+
     def calc_targets(self, signal: dict) -> dict:
-        price = signal["price"]
-        s     = signal["strategy"]
-        cfg   = self.cfg
+        price  = signal["price"]
+        s      = signal["strategy"]
+        symbol = signal.get("symbol", "")
+        gain   = signal.get("gain_pct", 0)
+        vol_r  = signal.get("vol_ratio", 1.0)
+
+        # ── حساب ATR ديناميكي ──────────────────────────────────
+        atr_pct = 0.0
+        support, resist = 0.0, 0.0
+        if symbol:
+            atr_pct = self._calc_atr(symbol, "1h", 14)
+            support, resist = self._calc_support_resistance(symbol)
+
+        # fallback إذا فشل ATR
+        if atr_pct <= 0:
+            atr_pct = 2.5
+
+        # ── SL ديناميكي: 1.2× ATR تحت الدخول (لا يقل عن 1.5% ولا يزيد عن 6%) ──
+        sl_pct = max(1.5, min(6.0, atr_pct * 1.2))
+        # إذا كان هناك دعم قريب وأقرب من ATR → استخدمه
+        if support > 0 and support < price:
+            support_dist = (price - support) / price * 100
+            if support_dist < sl_pct:
+                sl_pct = max(1.5, support_dist * 0.95)
+
+        # ── TP ديناميكي: نسبة Risk/Reward لا تقل عن 2:1 ──────
+        rr_min = 2.0  # الحد الأدنى لنسبة المكسب/الخسارة
 
         if s == "S1":
-            sl  = price * (1 - cfg.s1_sl_pct / 100)
-            tp1 = price * (1 + cfg.s1_tp1_pct / 100)
-            tp2 = price * (1 + cfg.s1_tp2_pct / 100)
-            tp3 = tp2 * 1.05
+            # RSI oversold: هدف أعلى لأن الارتداد قوي
+            tp1_pct = max(sl_pct * rr_min, atr_pct * 2.0)
+            tp2_pct = tp1_pct * 1.8
+            tp3_pct = tp2_pct * 1.3
+
         elif s == "S2":
-            sl  = price * (1 - cfg.s2_sl_pct / 100)
-            tp1 = price * (1 + cfg.s2_tp1_pct / 100)
-            tp2 = tp1 * 1.05
-            tp3 = tp1 * 1.10
+            # momentum: هدف معتدل
+            tp1_pct = max(sl_pct * rr_min, atr_pct * 1.5)
+            tp2_pct = tp1_pct * 1.5
+            tp3_pct = tp2_pct * 1.3
+
         elif s == "NEW_LISTING":
-            sl  = price * (1 - cfg.new_listing_sl_pct / 100)
-            tp1 = price * (1 + cfg.new_listing_tp_pct / 100)
-            tp2 = tp1 * 1.20
-            tp3 = tp1 * 1.50
+            # listing جديد: تذبذب عالٍ جداً → أهداف أكبر
+            tp1_pct = max(10.0, gain * 0.5)
+            tp2_pct = tp1_pct * 2.0
+            tp3_pct = tp1_pct * 3.5
+            sl_pct  = max(5.0, atr_pct * 1.5)
+
         else:  # S3 Rocket
-            sl  = price * (1 - cfg.s3_sl_pct / 100)
-            tp1 = price * (1 + cfg.s3_partial1_pct / 100)
-            tp2 = price * (1 + cfg.s3_partial2_pct / 100)
-            tp3 = price * (1 + cfg.s3_partial2_pct / 100 * 2)
+            # rocket: الزخم قوي → TP بناءً على قوة الإشارة
+            # كلما زاد gain_pct وvol_ratio كلما رفعنا الهدف
+            momentum_boost = min(2.0, 1.0 + (gain / 50) + (vol_r / 10))
+            tp1_pct = max(sl_pct * rr_min, atr_pct * 1.5 * momentum_boost)
+            tp1_pct = max(3.0, min(15.0, tp1_pct))  # حدود: 3%-15%
+            tp2_pct = tp1_pct * 1.8
+            tp3_pct = tp2_pct * 1.5
+            # إذا كانت مقاومة قريبة → اجعل TP1 قبلها قليلاً
+            if resist > 0 and resist > price:
+                resist_dist = (resist - price) / price * 100
+                if resist_dist < tp1_pct:
+                    tp1_pct = max(sl_pct * rr_min, resist_dist * 0.92)
+
+        sl  = price * (1 - sl_pct  / 100)
+        tp1 = price * (1 + tp1_pct / 100)
+        tp2 = price * (1 + tp2_pct / 100)
+        tp3 = price * (1 + tp3_pct / 100)
+
+        _log(f"[Targets] {symbol} ATR={atr_pct:.2f}% SL={sl_pct:.2f}% "
+             f"TP1={tp1_pct:.2f}% TP2={tp2_pct:.2f}% S/R={support:.4g}/{resist:.4g}")
 
         return {"sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3}
 
@@ -1940,7 +2024,7 @@ class Orchestrator:
 
             price   = result["price"]
             qty     = result["qty"]
-            targets = self.strategy.calc_targets({**signal, "price": price})
+            targets = self.strategy.calc_targets({**signal, "price": price, "symbol": symbol})
 
             # وضع TP1 Limit Order
             tp1_oid = await asyncio.get_event_loop().run_in_executor(
@@ -2169,7 +2253,8 @@ class Orchestrator:
                                         price_b = result["price"]
                                         qty = result["qty"]
                                         signal = {"strategy": "S3", "rsi": 50, "gain_pct": pct,
-                                                  "vol_ratio": 1.0, "price": price_b, "trigger": "SAFE"}
+                                                  "vol_ratio": 1.0, "price": price_b, "trigger": "SAFE",
+                                                  "symbol": sym}
                                         targets = self.strategy.calc_targets(signal)
                                         tp1_oid = await asyncio.get_event_loop().run_in_executor(
                                             None, self.ex.place_limit_sell, sym, qty, targets["tp1"]
