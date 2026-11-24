@@ -487,12 +487,18 @@ class Executor:
             _log(f"[Executor] place_limit_sell {symbol}: {e}")
             return None
 
-    def market_sell(self, symbol: str, qty: float) -> bool:
+    def market_sell(self, symbol: str, qty: float):
+        """
+        Returns:
+          True   — بيع ناجح
+          "dust" — قيمة أقل من $1 (30002)، لا يمكن بيعها → تُعامَل كغبار
+          False  — فشل عام
+        """
         for attempt in range(1, 4):  # 3 محاولات فقط
             try:
                 prec = float(self.exchange.amount_to_precision(symbol, qty))
                 if prec <= 0:
-                    return False
+                    return "dust"
                 self.exchange.create_market_sell_order(symbol, prec)
                 _log(f"[Executor] ✅ SELL {symbol} qty={prec:.6f}")
                 return True
@@ -509,13 +515,23 @@ class Executor:
                 return False
             except Exception as e:
                 err = str(e)
-                # 30002 = أقل من الحد الأدنى ($1) — غبار لا يمكن بيعه → تجاهل
+                # 30002 = أقل من الحد الأدنى ($1) — غبار لا يمكن بيعه
                 if "30002" in err or "minimum" in err.lower():
-                    _log(f"[Executor] ⚠️ {symbol} أقل من الحد الأدنى — تجاهل (غبار)")
-                    return False
+                    _log(f"[Executor] ⚠️ {symbol} أقل من الحد الأدنى — غبار")
+                    return "dust"
                 _log(f"[Executor] market_sell {symbol} attempt {attempt}: {e}")
                 time.sleep(2)
         return False
+
+    def fetch_coin_balance_usdt(self, symbol: str, price: float) -> float:
+        """يجلب القيمة الفعلية للعملة على البورصة بالدولار"""
+        try:
+            base = symbol.replace("/USDT", "")
+            bal = self.exchange.fetch_balance({"type": "spot"})
+            qty = float(bal.get(base, {}).get("free", 0)) + float(bal.get(base, {}).get("used", 0))
+            return qty * price
+        except Exception:
+            return -1  # -1 = فشل الجلب، لا نعامله كغبار
 
     def cancel_order(self, symbol: str, order_id: str):
         try:
@@ -1533,27 +1549,42 @@ class TradeMonitor:
                         _log(f"[Monitor] 🧹 emergency_sell {symbol}: qty=0 → تجاهل (غبار)")
                         if state: self.slots.release(symbol)
                         continue
-                    sell_ok = await asyncio.get_event_loop().run_in_executor(
+                    # ── تحقق من الرصيد الفعلي أولاً — إذا < $1 → غبار مباشرة ──
+                    _price_now = self.ex.live_price(symbol)
+                    _actual_val = await asyncio.get_event_loop().run_in_executor(
+                        None, self.ex.fetch_coin_balance_usdt, symbol, _price_now
+                    )
+                    if _actual_val >= 0 and _actual_val < 1.0:
+                        _log(f"[Monitor] 🧹 emergency_sell {symbol}: رصيد فعلي=${_actual_val:.4f} < $1 → غبار مباشرة")
+                        if state and state.db_trade_id:
+                            _pnl = (_price_now - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
+                            self.db.close_trade(state.db_trade_id, _price_now, qty, "dust_cleanup",
+                                                (_price_now - state.entry_price) * qty if state.entry_price else 0, _pnl)
+                        if state: self.slots.release(symbol)
+                        continue
+                    sell_result = await asyncio.get_event_loop().run_in_executor(
                         None, self.ex.market_sell, symbol, qty
                     )
-                    # market_sell يُرجع False إذا كان غباراً (30002) → نعتبره منتهياً
-                    if sell_ok or not sell_ok:
-                        # تحقق من السبب: إذا القيمة < $1 → غبار → أغلق الصفقة
-                        price = self.ex.live_price(symbol)
-                        val = qty * price
-                        if sell_ok:
-                            _log(f"[Monitor] ✅ Retry emergency_sell {symbol} نجح")
-                        else:
-                            _log(f"[Monitor] 🧹 emergency_sell {symbol}: val=${val:.2f} → غبار أو فشل دائم → إغلاق DB")
-                        if state and state.db_trade_id:
-                            pnl = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
-                            self.db.close_trade(
-                                state.db_trade_id, price, qty,
-                                "emergency_sl" if sell_ok else "dust_cleanup",
-                                (price - state.entry_price) * qty if state.entry_price else 0, pnl
-                            )
-                        self.slots.release(symbol)
+                    price = self.ex.live_price(symbol)
+                    val = qty * price
+                    if sell_result == True:
+                        _log(f"[Monitor] ✅ Retry emergency_sell {symbol} نجح")
+                        close_reason = "emergency_sl"
+                    elif sell_result == "dust":
+                        _log(f"[Monitor] 🧹 emergency_sell {symbol}: غبار (val=${val:.2f}) → إغلاق")
+                        close_reason = "dust_cleanup"
+                    else:
+                        # فشل عادي → أعد المحاولة لاحقاً
+                        remaining.append(task)
                         continue
+                    if state and state.db_trade_id:
+                        pnl = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
+                        self.db.close_trade(
+                            state.db_trade_id, price, qty, close_reason,
+                            (price - state.entry_price) * qty if state.entry_price else 0, pnl
+                        )
+                    self.slots.release(symbol)
+                    continue
                 elif action == "place_tp":
                     if state:
                         oid = await asyncio.get_event_loop().run_in_executor(
@@ -1584,6 +1615,18 @@ class TradeMonitor:
         if price <= 0:
             return
 
+        # ── تحقق من الغبار قبل أي شيء ──
+        qty = state.remaining_qty if state.remaining_qty > 0 else state.filled_qty
+        val = qty * price
+        if val < 1.0 and qty > 0:
+            _log(f"[Monitor] 🧹 {state.symbol} غبار (val=${val:.4f} < $1) → إغلاق تلقائي")
+            if state.db_trade_id:
+                pnl_pct_d = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
+                pnl_usd_d = (price - state.entry_price) * qty if state.entry_price else 0
+                self.db.close_trade(state.db_trade_id, price, qty, "dust_cleanup", pnl_usd_d, pnl_pct_d)
+            self.slots.release(state.symbol)
+            return
+
         pnl_pct = (price - state.entry_price) / state.entry_price * 100
 
         if price > state.highest_price:
@@ -1596,6 +1639,18 @@ class TradeMonitor:
         await self._update_trailing(state, price, pnl_pct)
 
         if price <= state.sl_price and state.sl_price > 0:
+            # ── تحقق من الرصيد الفعلي قبل البيع — منع حلقة الغبار ──
+            actual_val = await asyncio.get_event_loop().run_in_executor(
+                None, self.ex.fetch_coin_balance_usdt, state.symbol, price
+            )
+            if actual_val >= 0 and actual_val < 1.0:
+                _log(f"[Monitor] 🧹 SL {state.symbol} رصيد فعلي=${actual_val:.4f} < $1 → غبار، إغلاق بدون بيع")
+                if state.db_trade_id:
+                    pnl_pct_sl = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
+                    pnl_usd_sl = (price - state.entry_price) * (state.remaining_qty or state.filled_qty) if state.entry_price else 0
+                    self.db.close_trade(state.db_trade_id, price, state.remaining_qty or state.filled_qty, "dust_cleanup", pnl_usd_sl, pnl_pct_sl)
+                self.slots.release(state.symbol)
+                return
             _log(f"[Monitor] 🛑 SL {state.symbol} price={price:.6g} sl={state.sl_price:.6g}")
             await self._close_position(state, price, "sl")
             return
@@ -1632,7 +1687,7 @@ class TradeMonitor:
         ok = await asyncio.get_event_loop().run_in_executor(
             None, self.ex.market_sell, state.symbol, qty_tp1
         )
-        if ok:
+        if ok and ok != "dust":
             remaining = state.filled_qty * 0.50
             pnl_usd   = (price - state.entry_price) * qty_tp1
 
@@ -1717,10 +1772,19 @@ class TradeMonitor:
 
     async def _close_position(self, state: SlotState, price: float, reason: str):
         qty = state.remaining_qty if state.remaining_qty > 0 else state.filled_qty
-        ok  = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_event_loop().run_in_executor(
             None, self.ex.market_sell, state.symbol, qty
         )
-        if not ok:
+        # dust = القيمة أقل من $1، نعتبرها مُباعة ونُغلق الصفقة
+        if result == "dust":
+            _log(f"[Monitor] 🧹 {state.symbol} غبار (< $1) → إغلاق الصفقة بدون بيع")
+            if state.db_trade_id:
+                pnl_pct = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
+                pnl_usd = (price - state.entry_price) * qty if state.entry_price else 0
+                self.db.close_trade(state.db_trade_id, price, qty, "dust_cleanup", pnl_usd, pnl_pct)
+            self.slots.release(state.symbol)
+            return
+        if not result:
             self.add_pending({"action": "emergency_sell", "symbol": state.symbol, "qty": qty})
             return
         pnl_pct = (price - state.entry_price) / state.entry_price * 100
