@@ -398,6 +398,7 @@ class Executor:
         self.cfg = cfg
         self.exchange: ccxt.mexc = self._connect()
         self._geo_blocked: set = set()  # عملات محجوبة جغرافياً (11444)
+        self._tickers_cache: dict = {}  # آخر fetch_tickers
 
     def _connect(self) -> ccxt.mexc:
         ex = ccxt.mexc({
@@ -518,6 +519,7 @@ class Executor:
         """
         try:
             tickers = self.exchange.fetch_tickers()
+            self._tickers_cache = tickers  # حفظ صريح للـ cache
             gainers = []
             for symbol, t in tickers.items():
                 if not symbol.endswith("/USDT"):
@@ -1153,7 +1155,7 @@ class StrategyEngine:
 
         # شرط C: سريع من الـ tickers المُخزنة (24H gain >= 10%)
         try:
-            cached = getattr(self.ex.exchange, "tickers", {}) or {}
+            cached = self.ex._tickers_cache or {}
             t = cached.get(symbol, {})
             if t:
                 gain_24h = float(t.get("percentage") or t.get("change") or 0)
