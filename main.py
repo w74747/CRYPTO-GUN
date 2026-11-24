@@ -1974,7 +1974,7 @@ class Orchestrator:
                     except Exception as e:
                         _log(f"[LunarCrush] ⚠️ {e}")
 
-                    # 2a. SAFE_COINS أولاً — مضمونة التداول، تُفحص في كل دورة
+                    # 2a. SAFE_COINS أولاً — شراء مباشر بدون فلاتر
                     if self.slots.free > 0:
                         _log("[SafeScan] 🛡️ فحص SAFE_COINS أولاً...")
                         try:
@@ -1989,20 +1989,62 @@ class Orchestrator:
                                 t = cached.get(sym, {})
                                 pct = float(t.get("percentage") or t.get("change") or 0)
                                 vol_usd = float(t.get("quoteVolume") or 0)
-                                # قبول أي SAFE_COIN مع gain إيجابي ولو صغير
-                                if pct > 0 and vol_usd > 100000:
-                                    safe_candidates.append((sym, pct))
-                            # ترتيب بحسب أعلى gain
+                                price_s = float(t.get("last") or t.get("close") or 0)
+                                if pct > 0 and vol_usd > 100000 and price_s > 0:
+                                    safe_candidates.append((sym, pct, price_s))
                             safe_candidates.sort(key=lambda x: x[1], reverse=True)
                             if safe_candidates:
-                                _log(f"[SafeScan] ✅ {len(safe_candidates)} SAFE_COIN قابلة للتداول — أعلاها: {safe_candidates[0]}")
-                                for sym, pct in safe_candidates[:3]:
+                                _log(f"[SafeScan] ✅ {len(safe_candidates)} SAFE_COIN — أعلاها: {safe_candidates[0][0]} {safe_candidates[0][1]:.1f}%")
+                                for sym, pct, price_s in safe_candidates[:2]:
                                     if self.slots.free == 0:
                                         break
-                                    await self._process_symbol(
-                                        session, sym, capital,
-                                        signal_source="safe_coin_scan"
+                                    if not self.slots.is_vacant(sym):
+                                        continue
+                                    _log(f"[SafeScan] 🛒 شراء مباشر: {sym} @ {price_s:.6g} gain={pct:.1f}%")
+                                    result = await asyncio.get_event_loop().run_in_executor(
+                                        None, self.ex.market_buy, sym, capital
                                     )
+                                    if result:
+                                        price_b = result["price"]
+                                        qty = result["qty"]
+                                        signal = {"strategy": "S3", "rsi": 50, "gain_pct": pct,
+                                                  "vol_ratio": 1.0, "price": price_b, "trigger": "SAFE"}
+                                        targets = self.strategy.calc_targets(signal)
+                                        tp1_oid = await asyncio.get_event_loop().run_in_executor(
+                                            None, self.ex.place_limit_sell, sym, qty, targets["tp1"]
+                                        )
+                                        state = SlotState(
+                                            symbol=sym, strategy="S3",
+                                            signal_source="safe_coin_scan",
+                                            entry_price=price_b, filled_qty=qty, remaining_qty=qty,
+                                            capital=capital, sl_price=targets["sl"],
+                                            tp1_price=targets["tp1"], tp2_price=targets["tp2"],
+                                            tp3_price=targets["tp3"], tp1_order_id=tp1_oid or "",
+                                            db_trade_id=None, highest_price=price_b,
+                                        )
+                                        trade_id = self.db.upsert_trade(
+                                            sym, "S3", price_b, qty, capital,
+                                            targets["sl"], targets["tp1"], targets["tp2"], targets["tp3"],
+                                            ai_verdict="auto", tp1_order_id=tp1_oid or "",
+                                            signal_source="safe_coin_scan"
+                                        )
+                                        if trade_id:
+                                            state.db_trade_id = trade_id
+                                        self.slots.occupy(state)
+                                        await self._send_tg(
+                                            f"🛡️ <b>S3 SAFE — {sym}</b>\n"
+                                            "━━━━━━━━━━━━━━━━━━━━\n"
+                                            f"💰 رأس المال: <code>${capital:.2f}</code>\n"
+                                            f"📍 دخول: <code>{price_b:.6g}</code>\n"
+                                            f"📊 24H gain={pct:.1f}%\n"
+                                            "━━━━━━━━━━━━━━━━━━━━\n"
+                                            f"🎯 TP1: <code>{targets['tp1']:.6g}</code>\n"
+                                            f"🎯 TP2: <code>{targets['tp2']:.6g}</code>\n"
+                                            f"🛡 SL: <code>{targets['sl']:.6g}</code>"
+                                        )
+                                        _log(f"[SafeScan] ✅ صفقة ناجحة: {sym} @ {price_b:.6g}")
+                                    else:
+                                        _log(f"[SafeScan] ❌ فشل شراء {sym}")
                             else:
                                 _log("[SafeScan] ℹ️ لا SAFE_COIN بـ gain إيجابي الآن")
                         except Exception as e:
