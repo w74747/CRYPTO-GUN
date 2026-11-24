@@ -563,9 +563,9 @@ class Executor:
             else:
                 _log(f"[TopGainers] ⚠️ لا رابح — سأفحص SAFE_COINS")
 
-            # دائماً أضف SAFE_COINS للبحث (بشرط ألا تكون محجوبة)
+            # SAFE_COINS أولاً (عملات كبيرة مضمونة) ثم الـ altcoins
             safe = [s for s in self.SAFE_COINS if s.replace("/USDT","") not in self._geo_blocked]
-            combined = top + [s for s in safe if s not in top]
+            combined = safe + [s for s in top if s not in safe]
             return combined[:count + len(safe)]
         except Exception as e:
             _log(f"[TopGainers] ❌ {e}")
