@@ -397,6 +397,7 @@ class Executor:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.exchange: ccxt.mexc = self._connect()
+        self._geo_blocked: set = set()  # عملات محجوبة جغرافياً (11444)
 
     def _connect(self) -> ccxt.mexc:
         ex = ccxt.mexc({
@@ -443,7 +444,12 @@ class Executor:
         except ccxt.InsufficientFunds as e:
             _log(f"[Executor] ❌ رصيد غير كافٍ {symbol}: {e}")
         except Exception as e:
+            err = str(e)
             _log(f"[Executor] ❌ market_buy {symbol}: {e}")
+            # 11444 = قيود جغرافية — أضف للـ blacklist تلقائياً
+            if "11444" in err:
+                self._geo_blocked.add(symbol.replace("/USDT", ""))
+                _log(f"[Executor] ⛔ {symbol} محجوبة جغرافياً — أُضيفت للـ blacklist")
         return None
 
     def place_limit_sell(self, symbol: str, qty: float, price: float) -> Optional[str]:
@@ -1645,6 +1651,8 @@ class Orchestrator:
             base = symbol.replace("/USDT", "")
             if self.cfg.shariah_filter and base in self.cfg.blacklisted_assets:
                 return
+            if base in self.ex._geo_blocked:
+                return  # محجوبة جغرافياً (11444)
 
             # اختر الاستراتيجية بناءً على المصدر
             signal = None
