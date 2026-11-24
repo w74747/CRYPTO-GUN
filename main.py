@@ -1144,6 +1144,23 @@ class StrategyEngine:
     def check_s3(self, symbol: str) -> Optional[dict]:
         if not self.cfg.s3_enabled:
             return None
+
+        # شرط C: سريع من الـ tickers المُخزنة (24H gain >= 10%)
+        try:
+            cached = getattr(self.ex.exchange, "tickers", {}) or {}
+            t = cached.get(symbol, {})
+            if t:
+                gain_24h = float(t.get("percentage") or t.get("change") or 0)
+                if gain_24h >= 10.0:
+                    price = float(t.get("last") or t.get("close") or 0)
+                    vol_usd = float(t.get("quoteVolume") or 0)
+                    if price > 0 and vol_usd >= self.cfg.min_volume_usd:
+                        _log(f"[S3🚀] {symbol} 24H={gain_24h:.1f}% vol=${vol_usd:.0f} — fast-track!")
+                        return {"strategy": "S3", "rsi": 50, "gain_pct": gain_24h,
+                                "vol_ratio": 1.5, "price": price, "trigger": "24H"}
+        except Exception:
+            pass
+
         df1h = self.ex.fetch_ohlcv(symbol, "1h", limit=24)
         if df1h is None or len(df1h) < 5:
             return None
@@ -1160,12 +1177,13 @@ class StrategyEngine:
         if rsi > self.cfg.s3_rsi_max:
             return None
 
-        vol_usd = vol_1h * price * 24
-        if vol_usd < self.cfg.s3_min_vol_usd:
-            return None
-
         # شرط A: ارتفاع سريع في ساعة
-        if gain_1h >= self.cfg.s3_gain_1h_min and vol_ratio >= self.cfg.s3_vol_spike:
+        # gain_1h >= 3% مع أي حجم (حجم USD يُفحص لاحقاً بالـ ticker)
+        # gain_1h >= 5% → دخول فوري بدون شرط vol_ratio
+        vol_ok_1h   = vol_ratio >= self.cfg.s3_vol_spike
+        strong_gain = gain_1h >= (self.cfg.s3_gain_1h_min + 2.0)  # 5%
+        if gain_1h >= self.cfg.s3_gain_1h_min and (vol_ok_1h or strong_gain):
+            _log(f"[S3] ✅ {symbol} 1H gain={gain_1h:.1f}% vol={vol_ratio:.1f}x RSI={rsi:.0f}")
             return {"strategy": "S3", "rsi": rsi, "gain_pct": gain_1h,
                     "vol_ratio": vol_ratio, "price": price, "trigger": "1H"}
 
@@ -1177,7 +1195,9 @@ class StrategyEngine:
             vol_4h    = float(df4h["vol"].iloc[-1])
             vol_avg4h = float(df4h["vol"].iloc[-8:].mean())
             vr4h      = vol_4h / vol_avg4h if vol_avg4h > 0 else 0
-            if gain_4h >= self.cfg.s3_gain_4h_min and vr4h >= self.cfg.s3_vol_spike:
+            strong_4h = gain_4h >= (self.cfg.s3_gain_4h_min + 3.0)  # 10%
+            if gain_4h >= self.cfg.s3_gain_4h_min and (vr4h >= self.cfg.s3_vol_spike or strong_4h):
+                _log(f"[S3] ✅ {symbol} 4H gain={gain_4h:.1f}% vol={vr4h:.1f}x RSI={rsi:.0f}")
                 return {"strategy": "S3", "rsi": rsi, "gain_pct": gain_4h,
                         "vol_ratio": vr4h, "price": price, "trigger": "4H"}
         return None
