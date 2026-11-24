@@ -1216,21 +1216,29 @@ class StrategyEngine:
         base = symbol.replace("/USDT","")
         is_safe = base in _SAFE
 
-        # شرط C: سريع من الـ tickers المُخزنة (24H gain >= 10%)
+        # شرط C/D: سريع من الـ tickers المُخزنة
         try:
             cached = self.ex._tickers_cache or {}
             t = cached.get(symbol, {})
             if t:
                 gain_24h = float(t.get("percentage") or t.get("change") or 0)
-                threshold = 3.0 if is_safe else 10.0  # عتبة مخففة للـ SAFE_COINS
+                price_c  = float(t.get("last") or t.get("close") or 0)
+                vol_usd  = float(t.get("quoteVolume") or 0)
+
+                # شرط D: SAFE_COINS — أي gain إيجابي (>0.5%) بحجم كافٍ
+                if is_safe and gain_24h >= 0.5 and price_c > 0 and vol_usd >= 500000:
+                    _log(f"[S3🛡️] {symbol} SAFE 24H={gain_24h:.1f}% vol=${vol_usd:.0f} — safe fast-track!")
+                    return {"strategy": "S3", "rsi": 50, "gain_pct": gain_24h,
+                            "vol_ratio": 1.0, "price": price_c, "trigger": "SAFE_24H"}
+
+                # شرط C: altcoins — gain >= 10%
+                threshold = 10.0
                 if gain_24h >= threshold:
-                    price = float(t.get("last") or t.get("close") or 0)
-                    vol_usd = float(t.get("quoteVolume") or 0)
-                    min_vol = 500000 if is_safe else self.cfg.min_volume_usd  # حجم أدنى أعلى للـ SAFE_COINS
-                    if price > 0 and vol_usd >= min_vol:
+                    min_vol = self.cfg.min_volume_usd
+                    if price_c > 0 and vol_usd >= min_vol:
                         _log(f"[S3🚀] {symbol} 24H={gain_24h:.1f}% vol=${vol_usd:.0f} — fast-track!")
                         return {"strategy": "S3", "rsi": 50, "gain_pct": gain_24h,
-                                "vol_ratio": 1.5, "price": price, "trigger": "24H"}
+                                "vol_ratio": 1.5, "price": price_c, "trigger": "24H"}
         except Exception:
             pass
 
@@ -1748,17 +1756,20 @@ class Orchestrator:
 
             signal["signal_source"] = signal_source
 
-            # فلتر الحجم
-            try:
-                ticker  = self.ex.exchange.fetch_ticker(symbol)
-                vol_usd = float(ticker.get("quoteVolume") or
-                                ticker.get("baseVolume", 0) * signal["price"])
-                min_vol = 10000 if force_new_listing else self.cfg.min_volume_usd
-                if vol_usd < min_vol:
-                    _log(f"[Vol] ⬇️ {symbol} حجم ${vol_usd:.0f} < ${min_vol:.0f} — تخطي")
+            # فلتر الحجم — SAFE_COINS تتجاوز هذا الفلتر (حجمها دائماً كافٍ)
+            _SAFE_SET2 = {s.replace("/USDT","") for s in self.ex.SAFE_COINS}
+            _skip_vol_check = symbol.replace("/USDT","") in _SAFE_SET2
+            if not _skip_vol_check:
+                try:
+                    ticker  = self.ex.exchange.fetch_ticker(symbol)
+                    vol_usd = float(ticker.get("quoteVolume") or
+                                    ticker.get("baseVolume", 0) * signal["price"])
+                    min_vol = 10000 if force_new_listing else self.cfg.min_volume_usd
+                    if vol_usd < min_vol:
+                        _log(f"[Vol] ⬇️ {symbol} حجم ${vol_usd:.0f} < ${min_vol:.0f} — تخطي")
+                        return
+                except Exception:
                     return
-            except Exception:
-                return
 
             # فلتر الأخبار السلبية (CryptoPanic)
             if self.news.is_blocked(symbol):
@@ -1777,8 +1788,10 @@ class Orchestrator:
                 _log(f"[LunarCrush🌙] 🔥 {symbol} Galaxy Score={score:.0f} — ضجة اجتماعية!")
                 signal["lunar_boost"] = True
 
-            # Order Book Pressure — فلتر إضافي
-            if self.cfg.orderbook_enabled and not force_new_listing:
+            # Order Book Pressure — فلتر إضافي (يُتجاوز لـ SAFE_COINS)
+            _SAFE_SET = {s.replace("/USDT","") for s in self.ex.SAFE_COINS}
+            _is_safe_coin = symbol.replace("/USDT","") in _SAFE_SET
+            if self.cfg.orderbook_enabled and not force_new_listing and not _is_safe_coin:
                 ob_ratio = await asyncio.get_event_loop().run_in_executor(
                     None, self.ex.get_orderbook_pressure, symbol
                 )
@@ -1789,15 +1802,20 @@ class Orchestrator:
                 if ob_ratio >= self.cfg.orderbook_ratio_min:
                     signal["ob_boost"] = True
 
-            # AI موافقة
-            ai_vote = await self.ai.approve(
-                session, symbol, signal["strategy"],
-                signal["rsi"], signal["gain_pct"], signal["vol_ratio"],
-                signal_source
-            )
-            if ai_vote == "reject":
-                _log(f"[AI] ❌ {symbol} رُفض")
-                return
+            # AI موافقة — SAFE_COINS تُوافق تلقائياً لتجنب التأخير
+            _SAFE_SET3 = {s.replace("/USDT","") for s in self.ex.SAFE_COINS}
+            if symbol.replace("/USDT","") in _SAFE_SET3:
+                ai_vote = "approve"
+                _log(f"[AI] 🛡️ {symbol} SAFE_COIN — موافقة تلقائية")
+            else:
+                ai_vote = await self.ai.approve(
+                    session, symbol, signal["strategy"],
+                    signal["rsi"], signal["gain_pct"], signal["vol_ratio"],
+                    signal_source
+                )
+                if ai_vote == "reject":
+                    _log(f"[AI] ❌ {symbol} رُفض")
+                    return
 
             if not self.slots.is_vacant(symbol):
                 return
@@ -1956,7 +1974,41 @@ class Orchestrator:
                     except Exception as e:
                         _log(f"[LunarCrush] ⚠️ {e}")
 
-                    # 2. الحصول على العملات المرشّحة مرتّبة
+                    # 2a. SAFE_COINS أولاً — مضمونة التداول، تُفحص في كل دورة
+                    if self.slots.free > 0:
+                        _log("[SafeScan] 🛡️ فحص SAFE_COINS أولاً...")
+                        try:
+                            cached = self.ex._tickers_cache or {}
+                            safe_candidates = []
+                            for sym in self.ex.SAFE_COINS:
+                                base = sym.replace("/USDT","")
+                                if base in self.ex._geo_blocked:
+                                    continue
+                                if not self.slots.is_vacant(sym):
+                                    continue
+                                t = cached.get(sym, {})
+                                pct = float(t.get("percentage") or t.get("change") or 0)
+                                vol_usd = float(t.get("quoteVolume") or 0)
+                                # قبول أي SAFE_COIN مع gain إيجابي ولو صغير
+                                if pct > 0 and vol_usd > 100000:
+                                    safe_candidates.append((sym, pct))
+                            # ترتيب بحسب أعلى gain
+                            safe_candidates.sort(key=lambda x: x[1], reverse=True)
+                            if safe_candidates:
+                                _log(f"[SafeScan] ✅ {len(safe_candidates)} SAFE_COIN قابلة للتداول — أعلاها: {safe_candidates[0]}")
+                                for sym, pct in safe_candidates[:3]:
+                                    if self.slots.free == 0:
+                                        break
+                                    await self._process_symbol(
+                                        session, sym, capital,
+                                        signal_source="safe_coin_scan"
+                                    )
+                            else:
+                                _log("[SafeScan] ℹ️ لا SAFE_COIN بـ gain إيجابي الآن")
+                        except Exception as e:
+                            _log(f"[SafeScan] ⚠️ {e}")
+
+                    # 2b. الحصول على العملات المرشّحة مرتّبة
                     priority_syms = self.signals.get_priority_symbols()
 
                     if priority_syms:
