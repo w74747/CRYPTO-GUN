@@ -2232,8 +2232,8 @@ class Orchestrator:
 
         # إرسال إشعار البداية كـ background task (لا يعطل الـ scan)
         async def _delayed_startup_notify():
-            _log("[TG] ⏳ انتظار 180ث قبل إشعار البداية...")
-            await asyncio.sleep(180)  # انتظار 3 دقائق بدل 2 لتجنب 429 عند restart
+            _log("[TG] ⏳ انتظار 300ث قبل إشعار البداية...")
+            await asyncio.sleep(300)  # 5 دقائق لتجنب 429 عند restart متكرر
             _log("[TG] 📤 إرسال إشعار البداية...")
             await self._startup_notify()
             if actions:
