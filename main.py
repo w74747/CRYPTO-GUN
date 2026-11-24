@@ -282,6 +282,9 @@ class TradeDB:
     def update_sl(self, trade_id: int, new_sl: float):
         self.execute("UPDATE trades SET sl_price=%s WHERE id=%s", (new_sl, trade_id))
 
+    def update_tp1_order_id(self, trade_id: int, tp1_order_id: str):
+        self.execute("UPDATE trades SET tp1_order_id=%s WHERE id=%s", (tp1_order_id, trade_id))
+
     def get_open_trades(self) -> list:
         rows = self.execute(
             "SELECT * FROM trades WHERE closed_at IS NULL ORDER BY opened_at",
@@ -456,11 +459,29 @@ class Executor:
 
     def place_limit_sell(self, symbol: str, qty: float, price: float) -> Optional[str]:
         try:
+            # جلب الرصيد الفعلي من الحساب لتجنب Oversold (30005)
+            base = symbol.replace("/USDT", "")
+            try:
+                bal = self.exchange.fetch_balance({"type": "spot"})
+                actual_free = float(bal.get(base, {}).get("free", 0) or
+                                    bal.get("free", {}).get(base, 0))
+                if actual_free > 0:
+                    # استخدم الأقل بين qty والرصيد الفعلي، مع هامش 0.5%
+                    safe_qty = min(qty, actual_free) * 0.995
+                    _log(f"[Executor] place_limit_sell {symbol}: qty={qty:.6f} actual={actual_free:.6f} safe={safe_qty:.6f}")
+                    qty = safe_qty
+            except Exception as be:
+                _log(f"[Executor] fetch_balance for sell: {be} — using qty*0.99")
+                qty = qty * 0.99  # fallback: تقليل 1%
+
             prec_qty = float(self.exchange.amount_to_precision(symbol, qty))
             if prec_qty <= 0:
+                _log(f"[Executor] place_limit_sell {symbol}: prec_qty=0, skip")
                 return None
             order = self.exchange.create_limit_sell_order(symbol, prec_qty, price)
-            return str(order.get("id", ""))
+            oid = str(order.get("id", ""))
+            _log(f"[Executor] ✅ TP1 order placed {symbol} qty={prec_qty} @ {price:.6g} id={oid}")
+            return oid
         except Exception as e:
             _log(f"[Executor] place_limit_sell {symbol}: {e}")
             return None
@@ -1617,6 +1638,23 @@ class AutoHeal:
                 self.slots.occupy(state)
                 actions.append(f"♻️ {sym}: استُرجع (${val:.2f} @ SL={sl:.6g})")
 
+                # إعادة وضع TP1 order إذا لم يكن موجوداً
+                tp1_id = t.get("tp1_order_id", "") or ""
+                tp1_price = float(t.get("tp1_price", 0))
+                if not tp1_id and tp1_price > 0 and qty > 0:
+                    _log(f"[AutoHeal] 🔁 إعادة وضع TP1 لـ {sym} qty={qty:.6f} @ {tp1_price:.6g}")
+                    try:
+                        new_oid = self.ex.place_limit_sell(sym, qty, tp1_price)
+                        if new_oid:
+                            self.slots.update(sym, tp1_order_id=new_oid)
+                            self.db.update_tp1_order_id(t["id"], new_oid)
+                            actions.append(f"📋 {sym}: TP1 order أُعيد وضعه → {new_oid[:8]}")
+                            _log(f"[AutoHeal] ✅ TP1 order لـ {sym}: {new_oid}")
+                        else:
+                            actions.append(f"⚠️ {sym}: TP1 order فشل — Monitor سيعيد المحاولة")
+                    except Exception as te:
+                        _log(f"[AutoHeal] ❌ TP1 retry {sym}: {te}")
+
             for base, qty in freqd.items():
                 if base in ("USDT", "USDC"):
                     continue
@@ -1867,6 +1905,14 @@ class Orchestrator:
 
             self.slots.occupy(state)
 
+            # إعادة محاولة TP1 إذا فشل وضعه
+            if not tp1_oid:
+                _log(f"[Bot] ⚠️ TP1 order فشل — ستُعاد المحاولة عبر Monitor")
+                self.monitor.add_pending({
+                    "action": "place_tp",
+                    "symbol": symbol,
+                })
+
             # إشعار Telegram
             emoji   = {"S3": "🚀", "NEW_LISTING": "🆕", "S1": "📉", "S2": "📈"}.get(signal["strategy"], "📊")
             boosts = []
@@ -2053,6 +2099,13 @@ class Orchestrator:
                                         if trade_id:
                                             state.db_trade_id = trade_id
                                         self.slots.occupy(state)
+                                        # إعادة محاولة TP1 إذا فشل
+                                        if not tp1_oid:
+                                            _log(f"[SafeScan] ⚠️ TP1 order فشل — ستُعاد المحاولة")
+                                            self.monitor.add_pending({
+                                                "action": "place_tp",
+                                                "symbol": sym,
+                                            })
                                         await self._send_tg(
                                             f"🛡️ <b>S3 SAFE — {sym}</b>\n"
                                             "━━━━━━━━━━━━━━━━━━━━\n"
