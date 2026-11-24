@@ -1957,19 +1957,20 @@ class Orchestrator:
         healer  = AutoHeal(self.cfg, self.ex, self.slots, self.db)
         actions = healer.run()
 
-        # إشعار Telegram واحد فقط عند البدء (لتجنب 429 rate limit)
-        # انتظار 90ث عند البدء — يمنح Telegram وقتاً للتعافي من rate limit
-        # المتراكم بسبب deployments متكررة
-        _log("[TG] ⏳ انتظار 90ث قبل أول رسالة (تجنب rate limit)...")
-        await asyncio.sleep(90)
-        _log("[TG] 📤 إرسال إشعار البداية...")
-        await self._startup_notify()
-        if actions:
-            await asyncio.sleep(2)  # فاصل صغير بين الرسائل
-            await self._send_tg(
-                "🔧 <b>Auto-Heal</b>\n" +
-                "\n".join(f"  {a}" for a in actions)
-            )
+        # إرسال إشعار البداية كـ background task (لا يعطل الـ scan)
+        async def _delayed_startup_notify():
+            _log("[TG] ⏳ انتظار 120ث قبل إشعار البداية...")
+            await asyncio.sleep(120)
+            _log("[TG] 📤 إرسال إشعار البداية...")
+            await self._startup_notify()
+            if actions:
+                await asyncio.sleep(5)
+                await self._send_tg(
+                    "🔧 <b>Auto-Heal</b>\n" +
+                    "\n".join(f"  {a}" for a in actions)
+                )
+
+        asyncio.create_task(_delayed_startup_notify())
 
         monitor_task = asyncio.create_task(self.monitor.start())
         try:
