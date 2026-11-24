@@ -1791,7 +1791,7 @@ class Orchestrator:
                 ob_ratio = await asyncio.get_event_loop().run_in_executor(
                     None, self.ex.get_orderbook_pressure, symbol
                 )
-                if ob_ratio < 0.8:  # ضغط بيع قوي — تجنب
+                if ob_ratio < 0.3:  # ضغط بيع حاد جداً — تجنب (خُفض من 0.8 إلى 0.3)
                     _log(f"[OrderBook] ⚠️ {symbol} ضغط بيع ({ob_ratio:.2f}) — تخطي")
                     return
                 # أضف نقاط إضافية إذا كان ضغط شراء قوي
