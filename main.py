@@ -1436,7 +1436,7 @@ class TradeMonitor:
             task["attempts"] += 1
             action = task.get("action")
             symbol = task.get("symbol", "")
-            max_att = 9999 if action == "emergency_sell" else 20
+            max_att = 5 if action == "emergency_sell" else 20
             if task["attempts"] > max_att:
                 _log(f"[Monitor] ⚠️ {symbol}/{action} تجاوز {max_att} محاولة")
                 continue
@@ -1444,18 +1444,30 @@ class TradeMonitor:
                 state = self.slots.get(symbol)
                 if action == "emergency_sell":
                     qty = task.get("qty", state.remaining_qty if state else 0)
-                    if qty > 0 and await asyncio.get_event_loop().run_in_executor(
+                    if qty <= 0:
+                        _log(f"[Monitor] 🧹 emergency_sell {symbol}: qty=0 → تجاهل (غبار)")
+                        if state: self.slots.release(symbol)
+                        continue
+                    sell_ok = await asyncio.get_event_loop().run_in_executor(
                         None, self.ex.market_sell, symbol, qty
-                    ):
+                    )
+                    # market_sell يُرجع False إذا كان غباراً (30002) → نعتبره منتهياً
+                    if sell_ok or not sell_ok:
+                        # تحقق من السبب: إذا القيمة < $1 → غبار → أغلق الصفقة
+                        price = self.ex.live_price(symbol)
+                        val = qty * price
+                        if sell_ok:
+                            _log(f"[Monitor] ✅ Retry emergency_sell {symbol} نجح")
+                        else:
+                            _log(f"[Monitor] 🧹 emergency_sell {symbol}: val=${val:.2f} → غبار أو فشل دائم → إغلاق DB")
                         if state and state.db_trade_id:
-                            price = self.ex.live_price(symbol)
-                            pnl   = (price - state.entry_price) / state.entry_price * 100
+                            pnl = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
                             self.db.close_trade(
                                 state.db_trade_id, price, qty,
-                                "emergency_sl", (price - state.entry_price) * qty, pnl
+                                "emergency_sl" if sell_ok else "dust_cleanup",
+                                (price - state.entry_price) * qty if state.entry_price else 0, pnl
                             )
                         self.slots.release(symbol)
-                        _log(f"[Monitor] ✅ Retry emergency_sell {symbol} نجح")
                         continue
                 elif action == "place_tp":
                     if state:
