@@ -563,10 +563,27 @@ class Executor:
             else:
                 _log(f"[TopGainers] ⚠️ لا رابح — سأفحص SAFE_COINS")
 
-            # SAFE_COINS أولاً (عملات كبيرة مضمونة) ثم الـ altcoins
-            safe = [s for s in self.SAFE_COINS if s.replace("/USDT","") not in self._geo_blocked]
-            combined = safe + [s for s in top if s not in safe]
-            return combined[:count + len(safe)]
+            # SAFE_COINS أولاً (عملات كبيرة مضمونة) — بغض النظر عن الـ gain%
+            # لأن معظم الـ altcoins محجوبة جغرافياً من Railway's IP
+            safe_with_gain = []
+            safe_no_gain = []
+            for sym in self.SAFE_COINS:
+                base = sym.replace("/USDT", "")
+                if base in self._geo_blocked:
+                    continue
+                t = tickers.get(sym, {})
+                pct = float(t.get("percentage") or t.get("change") or 0)
+                vol_usd = float(t.get("quoteVolume") or 0)
+                if pct >= 1.0 and vol_usd > 50000:  # عتبة مخففة للـ SAFE_COINS
+                    safe_with_gain.append(sym)
+                else:
+                    safe_no_gain.append(sym)  # إضافة حتى بدون gain (للـ fallback)
+
+            # ترتيب: SAFE_COINS مع gain أولاً، ثم altcoins، ثم SAFE_COINS بدون gain
+            combined = safe_with_gain + [s for s in top if s not in safe_with_gain] + safe_no_gain
+            if safe_with_gain:
+                _log(f"[TopGainers] 🛡️ SAFE_COINS رابحة: {safe_with_gain[:5]}")
+            return combined[:count + len(safe_with_gain) + len(safe_no_gain)]
         except Exception as e:
             _log(f"[TopGainers] ❌ {e}")
             return list(self.SAFE_COINS)
