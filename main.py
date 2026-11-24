@@ -739,7 +739,8 @@ class AIAdvisor:
 # TELEGRAM
 # ══════════════════════════════════════════════════════════════
 _tg_last_sent: float = 0.0  # وقت آخر رسالة ناجحة
-_tg_lock: asyncio.Lock = None  # global lock لمنع الإرسال المتزامن
+_tg_lock: asyncio.Lock = None  # global lock — رسالة واحدة في الوقت
+_tg_queue: asyncio.Queue = None  # queue لتسلسل الرسائل
 
 def _get_tg_lock():
     global _tg_lock
@@ -747,57 +748,57 @@ def _get_tg_lock():
         _tg_lock = asyncio.Lock()
     return _tg_lock
 
-async def tg_send(token: str, chat_id: str, text: str):
+async def _tg_send_raw(token: str, chat_id: str, text: str):
+    """إرسال مباشر — يُستدعى فقط من داخل tg_send مع lock مكتسب"""
     global _tg_last_sent
-    if not token or not chat_id:
-        return
-    if len(text) > 4000:
-        text = text[:4000] + "\n..."
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
 
-    # انتظار فترة بين الرسائل لتجنب 429
-    async with _get_tg_lock():
-        now = asyncio.get_event_loop().time()
-        elapsed = now - _tg_last_sent
-        if elapsed < 2.0:  # حد أدنى ثانيتين بين الرسائل
-            await asyncio.sleep(2.0 - elapsed)
+    # فاصل زمني إجباري بين الرسائل
+    now = time.time()
+    elapsed = now - _tg_last_sent
+    if elapsed < 3.0:
+        await asyncio.sleep(3.0 - elapsed)
 
-    for attempt in range(3):  # 3 محاولات بدل 8
+    for attempt in range(3):
         try:
             conn = aiohttp.TCPConnector(ssl=True, limit=3, force_close=True)
             async with aiohttp.ClientSession(connector=conn) as s:
                 resp = await s.post(
                     url, json=payload,
-                    timeout=aiohttp.ClientTimeout(
-                        total=60, connect=15, sock_read=45
-                    )
+                    timeout=aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
                 )
                 body = await resp.text()
                 if resp.status == 200:
                     _tg_last_sent = time.time()
                     _log("[TG] ✅ أُرسلت بنجاح")
                     return
-                _log(f"[TG] ⚠️ status={resp.status} body={body[:200]}")
+                _log(f"[TG] ⚠️ status={resp.status} body={body[:120]}")
                 if resp.status == 429:
                     try:
-                        wait = _json.loads(body).get("parameters", {}).get("retry_after", 35)
+                        wait = _json.loads(body).get("parameters", {}).get("retry_after", 30)
                     except Exception:
-                        wait = 35
+                        wait = 30
                     _log(f"[TG] ⏳ انتظار {wait}ث (rate limit)")
-                    await asyncio.sleep(wait + 3)
+                    await asyncio.sleep(wait + 2)
                 elif resp.status in (400, 401, 403):
                     _log(f"[TG] ❌ خطأ دائم ({resp.status}) — توقف")
                     return
                 else:
-                    await asyncio.sleep(10)
-        except asyncio.TimeoutError:
-            _log(f"[TG] ⏰ timeout — محاولة {attempt+1}/8 — انتظار 15ث")
-            await asyncio.sleep(15)
+                    await asyncio.sleep(5)
         except Exception as e:
-            _log(f"[TG] ❌ attempt {attempt+1}: {type(e).__name__}: {e}")
-            await asyncio.sleep(10)
-    _log("[TG] ❌ فشل الإرسال بعد 8 محاولات")
+            _log(f"[TG] ❌ attempt {attempt+1}: {type(e).__name__}: {str(e)[:60]}")
+            await asyncio.sleep(5)
+    _log("[TG] ❌ فشل الإرسال بعد 3 محاولات — تجاهل")
+
+async def tg_send(token: str, chat_id: str, text: str):
+    if not token or not chat_id:
+        return
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+    # lock يضمن إرسال رسالة واحدة في كل مرة
+    async with _get_tg_lock():
+        await _tg_send_raw(token, chat_id, text)
 
 
 # ══════════════════════════════════════════════════════════════
