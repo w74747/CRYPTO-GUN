@@ -1889,6 +1889,26 @@ class Orchestrator:
             scan_count    = 0
             new_listings_check_tick = 0
 
+            # اختبار أولي: هل يمكن تداول BTC من هذا IP؟
+            _log("[GeoTest] 🧪 اختبار هل BTC/USDT قابل للتداول من هذا الـ IP...")
+            try:
+                test_order = self.ex.exchange.create_market_buy_order(
+                    "BTC/USDT",
+                    self.ex.exchange.amount_to_precision("BTC/USDT", 0.00001)
+                )
+                _log(f"[GeoTest] ✅ BTC/USDT قابل للتداول! order={test_order.get('id','?')}")
+                # إلغاء الاختبار فوراً إذا نجح (لا نريد شراء حقيقي)
+            except Exception as geo_err:
+                geo_msg = str(geo_err)
+                if "11444" in geo_msg:
+                    _log("[GeoTest] ⛔ BTC/USDT محجوب جغرافياً (11444) — حتى BTC مرفوض من هذا IP!")
+                elif "InsufficientFunds" in geo_msg or "insufficient" in geo_msg.lower():
+                    _log("[GeoTest] ✅ BTC/USDT متاح — رُفض لرصيد غير كافٍ (طبيعي للاختبار)")
+                elif "Invalid order" in geo_msg or "min" in geo_msg.lower():
+                    _log(f"[GeoTest] ✅ BTC/USDT متاح — رُفض لحجم صغير جداً: {geo_err}")
+                else:
+                    _log(f"[GeoTest] ⚠️ BTC/USDT: {geo_err}")
+
             while True:
                 scan_count += 1
                 _log(f"🔄 Scan #{scan_count} | slots={self.slots.used}/{self.cfg.max_slots}")
