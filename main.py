@@ -1956,18 +1956,50 @@ class TradeMonitor:
     async def _reconcile(self):
         try:
             db_trades = self.db.get_open_trades()
+            if not db_trades:
+                return
+            bal = self.ex.exchange.fetch_balance({"type": "spot"})
             for t in db_trades:
                 sym = t["symbol"]
                 if not self.slots.get(sym):
-                    bal = self.ex.exchange.fetch_balance({"type": "spot"})
                     base = sym.replace("/USDT", "")
-                    actual_qty = float(bal.get(base, {}).get("free", 0))
-                    if actual_qty * self.ex.live_price(sym) < 1.0:
+                    # ✅ استخدم free + used (العملة قد تكون محجوزة في أوردر TP1 مفتوح)
+                    free_qty = float(bal.get(base, {}).get("free", 0))
+                    used_qty = float(bal.get(base, {}).get("used", 0))
+                    actual_qty = free_qty + used_qty
+                    val = actual_qty * self.ex.live_price(sym)
+
+                    # ✅ إذا كان هناك أوردر TP1 مفتوح → لا تُغلق أبداً
+                    tp1_id = t.get("tp1_order_id", "") or ""
+                    if tp1_id:
+                        try:
+                            status = self.ex.order_status(sym, tp1_id)
+                            if status in ("open", "partially_filled"):
+                                # الأوردر حي — لا تغلق الصفقة، أعد إدخالها في slots
+                                _log(f"[Reconcile] 🛡 {sym}: TP1 order مفتوح ({tp1_id[:8]}) → استرداد")
+                                entry = float(t.get("entry_price", 0))
+                                sl    = float(t.get("sl_price", 0)) or entry * 0.97
+                                tp1   = float(t.get("tp1_price", 0)) or entry * 1.05
+                                qty   = max(actual_qty, float(t.get("filled_qty", 0)))
+                                cap   = float(t.get("capital_usd", qty * self.ex.live_price(sym)))
+                                state = SlotState(
+                                    symbol=sym, strategy=t.get("strategy", "RESTORED"),
+                                    entry_price=entry, filled_qty=qty, remaining_qty=qty,
+                                    capital=cap, sl_price=sl, tp1_price=tp1,
+                                    tp1_order_id=tp1_id, db_trade_id=t["id"],
+                                    highest_price=self.ex.live_price(sym),
+                                )
+                                self.slots.occupy(state)
+                                continue
+                        except Exception:
+                            pass
+
+                    if val < 1.0:
                         self.db.close_trade(
                             t["id"], float(t.get("entry_price", 0)),
                             0, "reconcile_ghost", 0, 0
                         )
-                        _log(f"[Reconcile] 🧹 {sym}: صفقة DB بدون رصيد → أُغلقت")
+                        _log(f"[Reconcile] 🧹 {sym}: صفقة DB بدون رصيد (free={free_qty:.4f} used={used_qty:.4f}) → أُغلقت")
         except Exception as e:
             _log(f"[Reconcile] ⚠️ {e}")
 
