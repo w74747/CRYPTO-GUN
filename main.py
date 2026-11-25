@@ -147,6 +147,22 @@ class Config:
     })
     shariah_filter:     bool  = field(default_factory=lambda: os.environ.get("SHARIAH_FILTER_ENABLED", "false").lower() == "true")
 
+    # ── Fear & Greed ──
+    fear_greed_enabled:  bool  = field(default_factory=lambda: os.environ.get("FEAR_GREED_ENABLED", "true").lower() == "true")
+    fear_greed_freeze:   int   = field(default_factory=lambda: int(os.environ.get("FEAR_GREED_FREEZE_ABOVE", "85")))  # تجميد إذا > 85
+
+    # ── BTC Trend Filter ──
+    btc_filter_enabled:  bool  = field(default_factory=lambda: os.environ.get("BTC_FILTER_ENABLED", "true").lower() == "true")
+    btc_crash_threshold: float = field(default_factory=lambda: float(os.environ.get("BTC_CRASH_THRESHOLD", "-3.0")))  # %
+
+    # ── Open Interest ──
+    oi_enabled:          bool  = field(default_factory=lambda: os.environ.get("OI_ENABLED", "true").lower() == "true")
+
+    # ── EMA Cross ──
+    ema_cross_enabled:   bool  = field(default_factory=lambda: os.environ.get("EMA_CROSS_ENABLED", "true").lower() == "true")
+    ema_fast:            int   = field(default_factory=lambda: int(os.environ.get("EMA_FAST", "9")))
+    ema_slow:            int   = field(default_factory=lambda: int(os.environ.get("EMA_SLOW", "21")))
+
     # ── AI ──
     ai_enabled:         bool  = field(default_factory=lambda: os.environ.get("AI_COMMITTEE_ENABLED", "true").lower() == "true")
     deepseek_model:     str   = "deepseek-v4-flash"
@@ -711,6 +727,23 @@ def calc_rsi(closes: pd.Series, period: int = 14) -> float:
 def calc_ema(closes: pd.Series, period: int) -> float:
     return float(closes.ewm(span=period, adjust=False).mean().iloc[-1])
 
+def check_ema_cross(df: pd.DataFrame, fast: int = 9, slow: int = 21) -> str:
+    """
+    يفحص تقاطع EMA:
+    'bullish'  — EMA_fast > EMA_slow  (ترند صاعد) ✅
+    'bearish'  — EMA_fast < EMA_slow  (ترند هابط) ❌
+    'neutral'  — البيانات غير كافية
+    """
+    if df is None or len(df) < slow + 5:
+        return "neutral"
+    closes = df["close"]
+    ema_f = closes.ewm(span=fast,  adjust=False).mean()
+    ema_s = closes.ewm(span=slow,  adjust=False).mean()
+    # التقاطع الأخير: EMA_fast انتقل من أسفل EMA_slow إلى أعلاها (cross up)
+    if float(ema_f.iloc[-1]) > float(ema_s.iloc[-1]):
+        return "bullish"
+    return "bearish"
+
 
 # ══════════════════════════════════════════════════════════════
 # AI ADVISOR
@@ -1242,6 +1275,215 @@ class LunarCrushSignal:
 
     def is_hot(self, symbol: str) -> bool:
         return self.get_score(symbol) >= self.cfg.lunarcrush_min_score
+
+
+# ══════════════════════════════════════════════════════════════
+# FEAR & GREED INDEX  (alternative.me — مجاني بالكامل)
+# ══════════════════════════════════════════════════════════════
+class FearGreedIndex:
+    """
+    مؤشر الخوف والجشع من alternative.me
+    0–24   = Extreme Fear   ← أفضل وقت للشراء (أسعار قاع)
+    25–49  = Fear           ← شراء بحذر
+    50–74  = Greed          ← طبيعي
+    75–100 = Extreme Greed  ← سوق محموم → تقليل أحجام
+    يتجدد مرة كل ساعة.
+    """
+    URL = "https://api.alternative.me/fng/?limit=1"
+
+    def __init__(self):
+        self._value: int   = 50   # افتراضي: Neutral
+        self._label: str   = "Neutral"
+        self._last_refresh: float = 0.0
+        self._refresh_interval: float = 3600.0  # ساعة واحدة
+
+    async def refresh(self, session: aiohttp.ClientSession):
+        now = time.time()
+        if now - self._last_refresh < self._refresh_interval:
+            return
+        try:
+            async with session.get(
+                self.URL,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                if r.status != 200:
+                    return
+                data = await r.json(content_type=None)
+                entry = data.get("data", [{}])[0]
+                self._value = int(entry.get("value", 50))
+                self._label = entry.get("value_classification", "Neutral")
+                self._last_refresh = now
+                emoji = "😱" if self._value < 25 else "😨" if self._value < 50 else "😏" if self._value < 75 else "🤑"
+                _log(f"[FearGreed] {emoji} {self._value}/100 — {self._label}")
+        except Exception as e:
+            _log(f"[FearGreed] ⚠️ {e}")
+
+    @property
+    def value(self) -> int:
+        return self._value
+
+    @property
+    def label(self) -> str:
+        return self._label
+
+    def is_extreme_greed(self) -> bool:
+        """سوق محموم جداً → تقليل حجم الصفقات"""
+        return self._value >= 80
+
+    def is_extreme_fear(self) -> bool:
+        """خوف شديد → فرصة شراء بامتياز"""
+        return self._value <= 20
+
+    def position_size_multiplier(self) -> float:
+        """
+        مضاعف حجم الصفقة بناءً على المؤشر:
+        Extreme Fear  (0-20)  → 1.3×  (فرصة ذهبية)
+        Fear          (21-40) → 1.1×
+        Neutral       (41-60) → 1.0×
+        Greed         (61-79) → 0.85×
+        Extreme Greed (80-100)→ 0.65× (خطر انعكاس)
+        """
+        v = self._value
+        if v <= 20:   return 1.3
+        if v <= 40:   return 1.1
+        if v <= 60:   return 1.0
+        if v <= 79:   return 0.85
+        return 0.65
+
+
+# ══════════════════════════════════════════════════════════════
+# BTC TREND FILTER  (فلتر اتجاه السوق العام)
+# ══════════════════════════════════════════════════════════════
+class BTCTrendFilter:
+    """
+    يراقب حركة BTC كمؤشر للسوق الكلي:
+    - إذا BTC انخفض > 3% خلال آخر ساعة → تجميد فتح صفقات جديدة
+    - إذا BTC انخفض > 1.5% → تحذير + تقليل حجم
+    - إذا BTC مستقر أو صاعد → السوق آمن
+    يُحدَّث كل دقيقتين.
+    """
+
+    def __init__(self, ex: Executor):
+        self.ex = ex
+        self._change_1h: float  = 0.0
+        self._change_4h: float  = 0.0
+        self._last_refresh: float = 0.0
+        self._refresh_interval: float = 120.0  # دقيقتان
+
+    def refresh(self):
+        """يُحدِّث بيانات BTC من OHLCV (يُستدعى sync من thread executor)"""
+        now = time.time()
+        if now - self._last_refresh < self._refresh_interval:
+            return
+        try:
+            df1h = self.ex.fetch_ohlcv("BTC/USDT", "1h", limit=5)
+            if df1h is not None and len(df1h) >= 2:
+                close_now  = float(df1h["close"].iloc[-1])
+                close_prev = float(df1h["close"].iloc[-2])
+                self._change_1h = (close_now - close_prev) / close_prev * 100
+
+            df4h = self.ex.fetch_ohlcv("BTC/USDT", "4h", limit=3)
+            if df4h is not None and len(df4h) >= 2:
+                close_now  = float(df4h["close"].iloc[-1])
+                close_prev = float(df4h["close"].iloc[-2])
+                self._change_4h = (close_now - close_prev) / close_prev * 100
+
+            self._last_refresh = now
+            if self._change_1h < -1.5:
+                trend = "🔴 هابط" if self._change_1h < -3.0 else "🟠 تحذير"
+                _log(f"[BTCFilter] {trend} BTC 1H={self._change_1h:+.2f}% 4H={self._change_4h:+.2f}%")
+        except Exception as e:
+            _log(f"[BTCFilter] ⚠️ {e}")
+
+    @property
+    def change_1h(self) -> float:
+        return self._change_1h
+
+    @property
+    def change_4h(self) -> float:
+        return self._change_4h
+
+    def is_market_crashed(self) -> bool:
+        """BTC انهار → أوقف كل الصفقات الجديدة"""
+        return self._change_1h < -3.0
+
+    def is_market_weak(self) -> bool:
+        """BTC ضعيف → قلل الحجم"""
+        return self._change_1h < -1.5
+
+    def position_size_multiplier(self) -> float:
+        """
+        مضاعف حجم الصفقة بناءً على حركة BTC:
+        BTC > +1%   → 1.1× (سوق صاعد)
+        BTC -1%~+1% → 1.0× (طبيعي)
+        BTC < -1.5% → 0.7× (تحذير)
+        BTC < -3%   → 0.0× (تجميد كامل)
+        """
+        c = self._change_1h
+        if c > 1.0:    return 1.1
+        if c > -1.5:   return 1.0
+        if c > -3.0:   return 0.7
+        return 0.0  # تجميد كامل
+
+
+# ══════════════════════════════════════════════════════════════
+# OPEN INTEREST MONITOR  (MEXC Futures — مجاني)
+# ══════════════════════════════════════════════════════════════
+class OpenInterestMonitor:
+    """
+    يراقب Open Interest من MEXC Futures لتأكيد الزخم:
+    - OI يرتفع + سعر يرتفع  → زخم حقيقي ✅ (boost)
+    - OI يرتفع + سعر ثابت   → ضغط محتمل ⚠️ (تحذير)
+    - OI ينخفض               → تراجع الاهتمام (محايد)
+    يُحدَّث كل 5 دقائق.
+    """
+    OI_URL = "https://contract.mexc.com/api/v1/contract/open_interest/{symbol}"
+
+    def __init__(self):
+        self._cache: dict[str, dict] = {}  # symbol → {oi, timestamp}
+        self._prev:  dict[str, float] = {}  # symbol → oi_prev
+        self._refresh_interval = 300.0  # 5 دقائق
+
+    async def refresh_symbol(self, session: aiohttp.ClientSession, symbol: str) -> Optional[float]:
+        """يُحدِّث OI لعملة محددة ويُعيد نسبة التغيير%"""
+        mx_sym = symbol.replace("/USDT", "_USDT")
+        now = time.time()
+        cached = self._cache.get(symbol)
+        if cached and now - cached["ts"] < self._refresh_interval:
+            return cached.get("change_pct")
+        try:
+            url = self.OI_URL.format(symbol=mx_sym)
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                oi_now = float(data.get("data", {}).get("openInterest", 0) or 0)
+                if oi_now <= 0:
+                    return None
+                oi_prev = self._prev.get(symbol, oi_now)
+                change_pct = (oi_now - oi_prev) / oi_prev * 100 if oi_prev > 0 else 0.0
+                self._prev[symbol]  = oi_now
+                self._cache[symbol] = {"oi": oi_now, "change_pct": change_pct, "ts": now}
+                return change_pct
+        except Exception:
+            return None
+
+    def get_signal(self, symbol: str, price_change_pct: float) -> str:
+        """
+        يُعيد:
+         'boost'   — OI↑ + Price↑  (زخم حقيقي)
+         'warning' — OI↑ + Price↓  (احتمال liquidation)
+         'neutral' — غير كافٍ للحكم
+        """
+        cached = self._cache.get(symbol)
+        if not cached:
+            return "neutral"
+        oi_chg = cached.get("change_pct", 0.0)
+        if oi_chg > 5.0 and price_change_pct > 1.0:
+            return "boost"
+        if oi_chg > 5.0 and price_change_pct < -1.0:
+            return "warning"
+        return "neutral"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2260,6 +2502,9 @@ class Orchestrator:
         self.funding   = FundingRateDetector(cfg)
         self.news      = CryptoPanicFilter(cfg)
         self.lunar     = LunarCrushSignal(cfg)
+        self.fear_greed = FearGreedIndex()
+        self.btc_filter = BTCTrendFilter(self.ex)
+        self.oi_monitor = OpenInterestMonitor()
         self._processing: set = set()
         self._processing_lock = threading.Lock()
         self._report_tick = 0
@@ -2384,6 +2629,41 @@ class Orchestrator:
                 _log(f"[News🔴] ⚠️ {symbol} عليها أخبار سلبية — تخطي")
                 return
 
+            # ── فلتر BTC Trend ──
+            if self.cfg.btc_filter_enabled and not force_new_listing:
+                if self.btc_filter.is_market_crashed():
+                    _log(f"[BTCFilter] 🔴 BTC انهار {self.btc_filter.change_1h:+.2f}% — تجميد الصفقات الجديدة")
+                    return
+                if self.btc_filter.is_market_weak():
+                    _log(f"[BTCFilter] 🟠 BTC ضعيف {self.btc_filter.change_1h:+.2f}% — تقليل الحجم")
+                    signal["btc_weak"] = True  # يُستخدم لاحقاً لتقليل الحجم
+
+            # ── فلتر Fear & Greed (Extreme Greed تحذير فقط، لا تجميد) ──
+            if self.cfg.fear_greed_enabled:
+                fg = self.fear_greed.value
+                if fg >= self.cfg.fear_greed_freeze:
+                    _log(f"[FearGreed] 🤑 {fg}/100 Extreme Greed — تقليل حجم")
+                    signal["fg_extreme_greed"] = True
+                elif fg <= 20:
+                    _log(f"[FearGreed] 😱 {fg}/100 Extreme Fear — فرصة ذهبية!")
+                    signal["fg_extreme_fear"] = True
+
+            # ── EMA Cross — فلتر اتجاه (يُطبَّق على S1 و S2 فقط، S3 Rocket يُتجاوزه) ──
+            if self.cfg.ema_cross_enabled and signal.get("strategy") in ("S1", "S2"):
+                try:
+                    df1h = await asyncio.get_event_loop().run_in_executor(
+                        None, self.ex.fetch_ohlcv, symbol, "1h", 50
+                    )
+                    ema_trend = check_ema_cross(df1h, self.cfg.ema_fast, self.cfg.ema_slow)
+                    if ema_trend == "bearish":
+                        _log(f"[EMA🔀] ⬇️ {symbol} EMA{self.cfg.ema_fast}<EMA{self.cfg.ema_slow} — ترند هابط، تخطي {signal['strategy']}")
+                        return
+                    elif ema_trend == "bullish":
+                        _log(f"[EMA🔀] ✅ {symbol} EMA تقاطع صاعد")
+                        signal["ema_boost"] = True
+                except Exception:
+                    pass  # إذا فشل الفحص → لا نوقف الصفقة
+
             # Funding Rate — إضافة نقاط إذا كان squeeze candidate
             if self.funding.is_squeeze_candidate(symbol):
                 rate = self.funding.get_rate(symbol)
@@ -2427,6 +2707,35 @@ class Orchestrator:
 
             if not self.slots.is_vacant(symbol):
                 return
+
+            # ── تعديل حجم الصفقة بناءً على Fear & Greed + BTC Trend ──
+            capital_multiplier = 1.0
+            if self.cfg.fear_greed_enabled:
+                capital_multiplier *= self.fear_greed.position_size_multiplier()
+            if self.cfg.btc_filter_enabled:
+                capital_multiplier *= self.btc_filter.position_size_multiplier()
+            # حد أدنى 0.5× وأقصى 1.3×
+            capital_multiplier = max(0.5, min(1.3, capital_multiplier))
+            if abs(capital_multiplier - 1.0) > 0.05:
+                adj_capital = round(capital * capital_multiplier, 2)
+                _log(f"[CapAdj] 💰 {symbol} رأس مال: ${capital:.2f} × {capital_multiplier:.2f} = ${adj_capital:.2f}")
+                capital = adj_capital
+
+            # ── Open Interest — تحقق وسجّل ──
+            if self.cfg.oi_enabled:
+                try:
+                    oi_chg = await self.oi_monitor.refresh_symbol(session, symbol)
+                    if oi_chg is not None:
+                        price_chg = signal.get("gain_pct", 0.0)
+                        oi_sig = self.oi_monitor.get_signal(symbol, price_chg)
+                        if oi_sig == "boost":
+                            _log(f"[OI📊] ✅ {symbol} OI↑{oi_chg:+.1f}% + Price↑ — زخم حقيقي!")
+                            signal["oi_boost"] = True
+                        elif oi_sig == "warning":
+                            _log(f"[OI📊] ⚠️ {symbol} OI↑{oi_chg:+.1f}% + Price↓ — احتمال liquidation")
+                            signal["oi_warning"] = True
+                except Exception:
+                    pass
 
             # تنفيذ الشراء
             result = await asyncio.get_event_loop().run_in_executor(
@@ -2477,12 +2786,19 @@ class Orchestrator:
             # إشعار Telegram
             emoji   = {"S3": "🚀", "NEW_LISTING": "🆕", "S1": "📉", "S2": "📈"}.get(signal["strategy"], "📊")
             boosts = []
-            if signal.get("ob_boost"):        boosts.append("📚 Order Book")
-            if signal.get("funding_boost"):   boosts.append("📉 Funding Squeeze")
-            if signal.get("lunar_boost"):     boosts.append("🌙 Social Buzz")
+            if signal.get("ob_boost"):          boosts.append("📚 Order Book")
+            if signal.get("funding_boost"):     boosts.append("📉 Funding Squeeze")
+            if signal.get("lunar_boost"):       boosts.append("🌙 Social Buzz")
+            if signal.get("ema_boost"):         boosts.append("🔀 EMA Cross↑")
+            if signal.get("oi_boost"):          boosts.append("📊 OI↑ Confirm")
+            if signal.get("fg_extreme_fear"):   boosts.append(f"😱 Fear={self.fear_greed.value}")
+            if signal.get("btc_weak"):          boosts.append(f"🟠 BTC{self.btc_filter.change_1h:+.1f}%")
+            if signal.get("fg_extreme_greed"):  boosts.append(f"🤑 Greed={self.fear_greed.value}")
+            if signal.get("oi_warning"):        boosts.append("⚠️ OI↑ Liquidation Risk")
             if signal_source == "binance_listing": boosts.append("📢 Binance Listed!")
             boost_note = (" | " + " + ".join(boosts)) if boosts else ""
             src_tag = f" [{signal_source}]" if signal_source != "scan" else ""
+            fg_line = f"🌡 F&G: {self.fear_greed.value}/100 {self.fear_greed.label} | BTC 1H: {self.btc_filter.change_1h:+.1f}%\n" if self.cfg.fear_greed_enabled else ""
             await self._send_tg(
                 f"{emoji} <b>{signal['strategy']} — {symbol}</b>{src_tag}\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
@@ -2490,6 +2806,7 @@ class Orchestrator:
                 f"📍 دخول: <code>{price:.6g}</code>\n"
                 f"📊 RSI={signal['rsi']:.0f} | "
                 f"Gain={signal['gain_pct']:.1f}% | Vol×{signal['vol_ratio']:.1f}{boost_note}\n"
+                f"{fg_line}"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎯 TP1: <code>{targets['tp1']:.6g}</code>\n"
                 f"🎯 TP2: <code>{targets['tp2']:.6g}</code>\n"
@@ -2622,6 +2939,22 @@ class Orchestrator:
                         await self.lunar.refresh(session)
                     except Exception as e:
                         _log(f"[LunarCrush] ⚠️ {e}")
+
+                    # تحديث Fear & Greed Index
+                    if self.cfg.fear_greed_enabled:
+                        try:
+                            await self.fear_greed.refresh(session)
+                        except Exception as e:
+                            _log(f"[FearGreed] ⚠️ {e}")
+
+                    # تحديث BTC Trend Filter
+                    if self.cfg.btc_filter_enabled:
+                        try:
+                            await asyncio.get_event_loop().run_in_executor(
+                                None, self.btc_filter.refresh
+                            )
+                        except Exception as e:
+                            _log(f"[BTCFilter] ⚠️ {e}")
 
                     # 2a. SAFE_COINS أولاً — شراء مباشر بدون فلاتر
                     if self.slots.free > 0:
