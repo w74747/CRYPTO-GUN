@@ -1930,6 +1930,8 @@ class TradeMonitor:
                 pnl_pct_d = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
                 pnl_usd_d = (price - state.entry_price) * qty if state.entry_price else 0
                 self.db.close_trade(state.db_trade_id, price, qty, "dust_cleanup", pnl_usd_d, pnl_pct_d)
+            # cooldown 30 دقيقة بعد إغلاق الغبار لمنع إعادة الشراء الفورية
+            self._closed_cooldown[state.symbol] = time.time()
             self.slots.release(state.symbol)
             return
 
@@ -2559,6 +2561,8 @@ class Orchestrator:
         self._processing: set = set()
         self._processing_lock = threading.Lock()
         self._report_tick = 0
+        # cooldown: منع إعادة شراء نفس العملة خلال 30 دقيقة من إغلاقها
+        self._closed_cooldown: dict[str, float] = {}  # symbol -> timestamp
 
     def _calc_capital(self) -> float:
         if self.cfg.capital > 0:
@@ -3017,10 +3021,17 @@ class Orchestrator:
                     if slots_possible > 0:
                         _log("[SafeScan] 🛡️ فحص SAFE_COINS أولاً...")
                         try:
+                            # تنظيف cooldown القديمة (أكثر من 30 دقيقة)
+                            now_cd = time.time()
+                            self._closed_cooldown = {
+                                s: t for s, t in self._closed_cooldown.items()
+                                if now_cd - t < 1800
+                            }
                             # جلب tickers مباشر لـ SAFE_COINS (لا نعتمد على cache)
                             safe_symbols = [s for s in self.ex.SAFE_COINS
                                            if s.replace("/USDT","") not in self.ex._geo_blocked
-                                           and self.slots.can_open(s, balance)]
+                                           and self.slots.can_open(s, balance)
+                                           and s not in self._closed_cooldown]
                             live_tickers = {}
                             if safe_symbols:
                                 try:
@@ -3055,8 +3066,8 @@ class Orchestrator:
                                         None, self.ex.market_buy, sym, capital
                                     )
                                     if result:
-                                        price_b = result["price"]
-                                        qty = result["qty"]
+                                        price_b = float(result["price"])
+                                        qty     = float(result["qty"])
                                         signal = {"strategy": "S3", "rsi": 50, "gain_pct": pct,
                                                   "vol_ratio": 1.0, "price": price_b, "trigger": "SAFE",
                                                   "symbol": sym}
@@ -3074,8 +3085,9 @@ class Orchestrator:
                                             db_trade_id=None, highest_price=price_b,
                                         )
                                         trade_id = self.db.upsert_trade(
-                                            sym, "S3", price_b, qty, capital,
-                                            targets["sl"], targets["tp1"], targets["tp2"], targets["tp3"],
+                                            sym, "S3", price_b, qty, float(capital),
+                                            float(targets["sl"]), float(targets["tp1"]),
+                                            float(targets["tp2"]), float(targets["tp3"]),
                                             ai_verdict="auto", tp1_order_id=tp1_oid or "",
                                             signal_source="safe_coin_scan"
                                         )
