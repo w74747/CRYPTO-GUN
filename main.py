@@ -280,6 +280,14 @@ class TradeDB:
                      is_futures: bool = False, ai_verdict: str = "",
                      tp1_order_id: str = "", sl_order_id: str = "",
                      signal_source: str = "scan") -> Optional[int]:
+        # تحويل صريح لـ float لمنع np.float64 من كسر PostgreSQL
+        entry_price = float(entry_price)
+        filled_qty  = float(filled_qty)
+        capital     = float(capital)
+        sl          = float(sl)
+        tp1         = float(tp1)
+        tp2         = float(tp2)
+        tp3         = float(tp3)
         with self._lock:
             conn = self._get_conn()
             if not conn:
@@ -297,9 +305,17 @@ class TradeDB:
                          tp1_order_id, sl_order_id),
                     )
                     r = c.fetchone()
-                    return r[0] if r else None
+                    trade_id = r[0] if r else None
+                    if trade_id:
+                        _log(f"[DB] ✅ تسجيل صفقة #{trade_id}: {symbol} @ {entry_price}")
+                    return trade_id
             except Exception as e:
-                _log(f"[DB] upsert_trade {symbol}: {e}")
+                _log(f"[DB] ❌ upsert_trade {symbol}: {e}")
+                try:
+                    if not conn.autocommit:
+                        conn.rollback()
+                except Exception:
+                    pass
                 return None
 
     def close_trade(self, trade_id: int, exit_price: float, exit_qty: float,
@@ -1889,7 +1905,8 @@ class StrategyEngine:
 # ══════════════════════════════════════════════════════════════
 class TradeMonitor:
     def __init__(self, cfg: Config, executor: Executor,
-                 slots: SlotManager, db: TradeDB):
+                 slots: SlotManager, db: TradeDB,
+                 closed_cooldown: dict = None):
         self.cfg      = cfg
         self.ex       = executor
         self.slots    = slots
@@ -1897,6 +1914,8 @@ class TradeMonitor:
         self._running = False
         self._pending: list[dict] = []
         self._reconcile_tick = 0
+        # مشترك مع Orchestrator — نفس القاموس بالمرجع لمنع إعادة شراء الغبار
+        self._closed_cooldown: dict[str, float] = closed_cooldown if closed_cooldown is not None else {}
 
     async def start(self):
         self._running = True
@@ -2660,7 +2679,6 @@ class Orchestrator:
         self.ex        = Executor(cfg)
         self.slots     = SlotManager(cfg.max_slots, cfg.capital_per_trade)
         self.slots._free_usdt_fn = self.ex.free_usdt  # ربط الرصيد الحر الديناميكي
-        self.monitor   = TradeMonitor(cfg, self.ex, self.slots, self.db)
         self.strategy  = StrategyEngine(cfg, self.ex)
         self.ai        = AIAdvisor(cfg)
         self.signals   = SignalAggregator(cfg, self.ex, self.db)
@@ -2674,8 +2692,13 @@ class Orchestrator:
         self._processing: set = set()
         self._processing_lock = threading.Lock()
         self._report_tick = 0
-        # cooldown: منع إعادة شراء نفس العملة خلال 30 دقيقة من إغلاقها
-        self._closed_cooldown: dict[str, float] = {}  # symbol -> timestamp
+        # cooldown مشترك: نفس القاموس بالمرجع بين Orchestrator و TradeMonitor
+        # TradeMonitor يُسجّل فيه، SafeScan يقرأ منه — لا إعادة شراء الغبار
+        self._closed_cooldown: dict[str, float] = {}
+        # عملات تم شراؤها في هذه الجلسة (لمنع التكرار حتى لو فشل DB)
+        self._session_bought: dict[str, float] = {}  # symbol -> timestamp آخر شراء
+        self.monitor   = TradeMonitor(cfg, self.ex, self.slots, self.db,
+                                      closed_cooldown=self._closed_cooldown)
 
     def _calc_capital(self) -> float:
         if self.cfg.capital > 0:
@@ -3143,10 +3166,16 @@ class Orchestrator:
                                 if now_cd - t < 1800
                             }
                             # جلب tickers مباشر لـ SAFE_COINS (لا نعتمد على cache)
+                            # تنظيف _session_bought القديمة (أكثر من ساعة)
+                            self._session_bought = {
+                                s: t for s, t in self._session_bought.items()
+                                if now_cd - t < 3600
+                            }
                             safe_symbols = [s for s in self.ex.SAFE_COINS
                                            if s.replace("/USDT","") not in self.ex._geo_blocked
                                            and self.slots.can_open(s, balance)
-                                           and s not in self._closed_cooldown]
+                                           and s not in self._closed_cooldown
+                                           and s not in self._session_bought]
                             live_tickers = {}
                             if safe_symbols:
                                 try:
@@ -3227,6 +3256,8 @@ class Orchestrator:
                                             f"🎯 TP2: <code>{targets['tp2']:.6g}</code>\n"
                                             f"🛡 SL: <code>{targets['sl']:.6g}</code>", "trade_open"
                                         )
+                                        self._session_bought[sym] = time.time()
+                                        self._closed_cooldown[sym] = time.time()  # cooldown فوري
                                         _log(f"[SafeScan] ✅ صفقة ناجحة: {sym} @ {price_b:.6g}")
                                     else:
                                         _log(f"[SafeScan] ❌ فشل شراء {sym}")
