@@ -199,8 +199,12 @@ class TradeDB:
         net_pnl_usd     DOUBLE PRECISION,
         net_pnl_pct     DOUBLE PRECISION,
         ai_verdict      TEXT,
-        notes           TEXT
+        notes           TEXT,
+        partial1_done   BOOLEAN DEFAULT FALSE,
+        remaining_qty   DOUBLE PRECISION DEFAULT 0
     );
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS partial1_done BOOLEAN DEFAULT FALSE;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS remaining_qty DOUBLE PRECISION DEFAULT 0;
     CREATE TABLE IF NOT EXISTS bot_cache (
         key     TEXT PRIMARY KEY,
         value   TEXT,
@@ -306,6 +310,13 @@ class TradeDB:
         self.execute(
             "UPDATE trades SET sl_price=%s, tp1_price=%s WHERE id=%s",
             (sl_price, tp1_price, trade_id)
+        )
+
+    def update_partial1(self, trade_id: int, remaining_qty: float, new_sl: float):
+        """يُسجّل تحقيق TP1 الجزئي في DB — يمنع تكرار الإشعار بعد إعادة التشغيل"""
+        self.execute(
+            "UPDATE trades SET partial1_done=TRUE, remaining_qty=%s, sl_price=%s WHERE id=%s",
+            (remaining_qty, new_sl, trade_id)
         )
 
     def get_open_trades(self) -> list:
@@ -2084,32 +2095,40 @@ class TradeMonitor:
         ok = await asyncio.get_event_loop().run_in_executor(
             None, self.ex.market_sell, state.symbol, qty_tp1
         )
-        if ok and ok != "dust":
-            remaining = state.filled_qty * 0.50
-            pnl_usd   = (price - state.entry_price) * qty_tp1
+        # ✅ اعتبر البيع ناجحاً إذا لم يُعد "dust" أو False صريح
+        sell_ok = (ok is True) or (ok and ok != "dust")
+        if not sell_ok:
+            # فشل البيع → سجّل partial1_done في الذاكرة فقط لمنع إعادة المحاولة الفورية
+            # لكن لا تحفظ في DB حتى لا نخسر الكمية
+            _log(f"[Monitor] ⚠️ TP1 sell فشل {state.symbol} → سيُعاد في الدورة القادمة")
+            return
 
-            # رفع SL للباقي إلى نقطة التعادل (entry) لحماية الربح
-            breakeven_sl = state.entry_price * 1.001  # +0.1% فوق الدخول
-            self.slots.update(state.symbol,
-                partial1_done=True,
-                remaining_qty=remaining,
-                sl_price=breakeven_sl,   # SL عند نقطة التعادل
-                trailing_sl=breakeven_sl
-            )
-            if state.db_trade_id:
-                self.db.update_sl(state.db_trade_id, breakeven_sl)
+        remaining = state.filled_qty * 0.50
+        pnl_usd   = (price - state.entry_price) * qty_tp1
 
-            _log(f"[Monitor] 🎯 TP1 {state.symbol} +{pnl_pct:.1f}% | "
-                 f"بيع 50% | SL→تعادل={breakeven_sl:.6g} | متابعة {remaining:.4f} بـ trailing")
+        # رفع SL للباقي إلى نقطة التعادل (entry) لحماية الربح
+        breakeven_sl = state.entry_price * 1.001  # +0.1% فوق الدخول
+        self.slots.update(state.symbol,
+            partial1_done=True,
+            remaining_qty=remaining,
+            sl_price=breakeven_sl,
+            trailing_sl=breakeven_sl
+        )
+        # ✅ حفظ في DB — يمنع تكرار إشعار TP1 بعد كل restart
+        if state.db_trade_id:
+            self.db.update_partial1(state.db_trade_id, remaining, breakeven_sl)
 
-            await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
-                f"🎯 <b>TP1 — {state.symbol}</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ بيع 50% عند +{pnl_pct:.1f}%\n"
-                f"💰 ربح مؤمَّن: <code>${pnl_usd:.2f}</code>\n"
-                f"🔄 الباقي 50% يتابع بـ Trailing Stop\n"
-                f"🛡 SL جديد → نقطة التعادل", "trade_close"
-            )
+        _log(f"[Monitor] 🎯 TP1 {state.symbol} +{pnl_pct:.1f}% | "
+             f"بيع 50% | SL→تعادل={breakeven_sl:.6g} | متابعة {remaining:.4f} بـ trailing")
+
+        await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
+            f"🎯 <b>TP1 — {state.symbol}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ بيع 50% عند +{pnl_pct:.1f}%\n"
+            f"💰 ربح مؤمَّن: <code>${pnl_usd:.2f}</code>\n"
+            f"🔄 الباقي 50% يتابع بـ Trailing Stop\n"
+            f"🛡 SL جديد → نقطة التعادل", "trade_close"
+        )
 
     async def _update_trailing(self, state: SlotState, price: float, pnl_pct: float):
         """
@@ -2154,8 +2173,9 @@ class TradeMonitor:
             sl_price=breakeven_sl,
             trailing_sl=breakeven_sl
         )
+        # ✅ حفظ في DB — يمنع تكرار إشعار TP1 بعد كل restart
         if state.db_trade_id:
-            self.db.update_sl(state.db_trade_id, breakeven_sl)
+            self.db.update_partial1(state.db_trade_id, remaining, breakeven_sl)
 
         _log(f"[Monitor] 🎯 TP1 filled {state.symbol} +{pnl_pct:.1f}% | trailing يبدأ")
         await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id,
@@ -2320,15 +2340,21 @@ class AutoHeal:
                 else:
                     _log(f"[AutoHeal] 🎯 {sym}: {review['note']}")
 
+                # ✅ استرجاع partial1_done و remaining_qty من DB لمنع تكرار إشعار TP1
+                db_partial1 = bool(t.get("partial1_done", False))
+                db_remaining = float(t.get("remaining_qty", 0))
+                restored_remaining = db_remaining if db_remaining > 0 else float(t.get("filled_qty", qty))
+
                 state = SlotState(
                     symbol=sym, strategy=t.get("strategy", "S1"),
                     signal_source=t.get("signal_source", "scan"),
                     entry_price=entry, filled_qty=float(t.get("filled_qty", qty)),
-                    remaining_qty=qty, capital=float(t.get("capital_usd", cap_per_slot)),
+                    remaining_qty=restored_remaining, capital=float(t.get("capital_usd", cap_per_slot)),
                     sl_price=sl, tp1_price=tp1,
                     tp2_price=float(t.get("tp2_price", 0)), tp3_price=float(t.get("tp3_price", 0)),
                     tp1_order_id=t.get("tp1_order_id", "") or "",
                     db_trade_id=t["id"], highest_price=price,
+                    partial1_done=db_partial1,
                 )
                 self.slots.occupy(state)
                 actions.append(f"♻️ {sym}: استُرجع (${val:.2f} @ SL={sl:.6g} TP1={tp1:.6g})")
