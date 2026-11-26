@@ -4,9 +4,10 @@ MEXC Scalping Bot v5 — Ultra Rocket Edition
 النسخة الأقوى: مصادر متعددة + كشف مبكر + مراقبة لحظية
 
 الاستراتيجيات:
-  S1 — RSI Bounce   : ارتداد من تشبع بيعي
-  S2 — Momentum     : زخم مع EMA
-  S3 — Rocket       : ارتفاع مفاجئ +5%+ مع حجم ضخم ← الرئيسي
+  S4 — Early Accum  : تراكم مبكر قبل الحركة (vol spike ×3 + RSI محايد) 🔮 تنبؤي
+  S1 — RSI Bounce   : ارتداد من تشبع بيعي                              📉 تنبؤي
+  S2 — Momentum     : زخم مع EMA وحجم                                  📈 شبه-تنبؤي
+  S3 — Rocket       : ارتفاع مفاجئ +5%+ مع حجم ضخم                    🚀 رجعي
 
 مصادر الإشارات (الجديدة):
   🏆 Top Gainers Scanner : أفضل 50 رابح كل 30 ث (بدلاً من فحص 3000!)
@@ -163,6 +164,16 @@ class Config:
     ema_cross_enabled:   bool  = field(default_factory=lambda: os.environ.get("EMA_CROSS_ENABLED", "true").lower() == "true")
     ema_fast:            int   = field(default_factory=lambda: int(os.environ.get("EMA_FAST", "9")))
     ema_slow:            int   = field(default_factory=lambda: int(os.environ.get("EMA_SLOW", "21")))
+
+    # ── S4: Early Accumulation (تنبؤي) ──
+    s4_enabled:          bool  = field(default_factory=lambda: os.environ.get("S4_ENABLED", "true").lower() == "true")
+    s4_vol_spike_15m:    float = field(default_factory=lambda: float(os.environ.get("S4_VOL_SPIKE_15M", "3.0")))   # حجم × 3 في 15min
+    s4_rsi_min:          float = field(default_factory=lambda: float(os.environ.get("S4_RSI_MIN", "35")))           # RSI صاعد من 35+
+    s4_rsi_max:          float = field(default_factory=lambda: float(os.environ.get("S4_RSI_MAX", "55")))           # لم يتشبع بعد
+    s4_price_stable_pct: float = field(default_factory=lambda: float(os.environ.get("S4_PRICE_STABLE_PCT", "2.0"))) # السعر لم يرتفع أكثر من 2% (قبل الحركة)
+    s4_min_vol_usd:      float = field(default_factory=lambda: float(os.environ.get("S4_MIN_VOL_USD", "50000")))
+    s4_tp1_pct:          float = field(default_factory=lambda: float(os.environ.get("S4_TP1_PCT", "4.0")))
+    s4_sl_pct:           float = field(default_factory=lambda: float(os.environ.get("S4_SL_PCT", "2.5")))
 
     # ── AI ──
     ai_enabled:         bool  = field(default_factory=lambda: os.environ.get("AI_COMMITTEE_ENABLED", "true").lower() == "true")
@@ -679,25 +690,52 @@ class Executor:
             _log(f"[TopGainers] ❌ {e}")
             return list(self.SAFE_COINS)
 
-    def fetch_volume_anomalies(self, spike_ratio: float = 5.0) -> list[str]:
+    def fetch_volume_anomalies(self, spike_ratio: float = 3.0) -> list[str]:
         """
         يكتشف العملات التي ارتفع حجمها فجأة أكثر من spike_ratio×
-        مقارنة بمتوسط آخر 24 ساعة.
+        مقارنة بمتوسط الساعة الأخيرة — كشف مبكر قبل الارتفاع.
+        يستخدم بيانات الـ ticker المُخزنة لسرعة الفحص.
         """
         try:
-            tickers = self.exchange.fetch_tickers()
+            cached = self._tickers_cache or {}
+            if not cached:
+                cached = self.exchange.fetch_tickers()
+                self._tickers_cache = cached
+
             anomalies = []
-            for symbol, t in tickers.items():
+            for symbol, t in cached.items():
                 if not symbol.endswith("/USDT"):
                     continue
-                # MEXC يوفر baseVolume و quoteVolume
-                vol_now = float(t.get("quoteVolume") or 0)
-                # نستخدم نسبة الحجم إذا كانت متاحة
-                # (نقارن الساعة الأخيرة بالمتوسط اليومي ÷ 24)
-                if vol_now > 100000:  # فلتر: حجم حد أدنى $100K
-                    # سنتحقق من OHLCV لاحقاً في check_s3
-                    anomalies.append(symbol)
-            return anomalies[:100]  # أول 100 فقط
+                # حجم الـ 24h الكلي
+                vol_24h = float(t.get("quoteVolume") or 0)
+                if vol_24h < 50000:   # حجم يومي أدنى $50K
+                    continue
+                # نسبة الحجم الحالية (MEXC يوفر info مع baseVolume)
+                # نحسب المتوسط الساعي = vol_24h / 24
+                avg_hourly = vol_24h / 24.0
+                # حجم آخر ساعة من الـ info إن أمكن، وإلا نقدر
+                info = t.get("info") or {}
+                vol_1h = float(info.get("volume", 0) or 0)
+                # إذا لم يتوفر vol_1h، نستخدم نسبة الـ 24h مقارنة بمتوسط يومي للسوق
+                if vol_1h <= 0:
+                    # استخدام gain_pct كمؤشر: حجم مرتفع مع gain منخفض = تراكم مبكر
+                    gain = float(t.get("percentage") or t.get("change") or 0)
+                    # نبحث عن عملات بها حجم كبير لكن gain لا يزال منخفضاً (قبل الحركة)
+                    if vol_24h >= 200000 and abs(gain) < 5.0:
+                        anomalies.append((symbol, vol_24h, gain))
+                    continue
+
+                ratio = vol_1h / avg_hourly if avg_hourly > 0 else 0
+                if ratio >= spike_ratio:
+                    gain = float(t.get("percentage") or t.get("change") or 0)
+                    anomalies.append((symbol, ratio, gain))
+
+            # ترتيب: الأكبر حجماً أولاً + gain لا يزال منخفضاً (فرص مبكرة)
+            anomalies.sort(key=lambda x: x[1], reverse=True)
+            result = [s for s, _, _ in anomalies[:80]]
+            if result:
+                _log(f"[VolumeAnomaly] 🌊 {len(result)} عملة حجمها شاذ")
+            return result
         except Exception as e:
             _log(f"[VolumeAnomaly] ❌ {e}")
             return []
@@ -1638,6 +1676,73 @@ class StrategyEngine:
                         "vol_ratio": vr4h, "price": price, "trigger": "4H"}
         return None
 
+    # ─── S4: Early Accumulation (تنبؤي 🔮) ───────────────────
+    def check_s4(self, symbol: str) -> Optional[dict]:
+        """
+        يكتشف التراكم المبكر قبل الارتفاع:
+        - Volume spike × 3 أو أكثر في الـ 15 دقيقة الأخيرة
+        - RSI في منطقة محايدة (35-55) ← لم يتشبع ولم يتأخر
+        - السعر لم يرتفع أكثر من 2% ← الأذكى يدخل أول
+        """
+        if not self.cfg.s4_enabled:
+            return None
+        try:
+            df15 = self.ex.fetch_ohlcv(symbol, "15m", limit=50)
+            if df15 is None or len(df15) < 20:
+                return None
+
+            price     = float(df15["close"].iloc[-1])
+            vol_now   = float(df15["vol"].iloc[-1])
+            vol_avg   = float(df15["vol"].iloc[-20:-1].mean())  # متوسط 19 شمعة سابقة
+            if vol_avg <= 0:
+                return None
+
+            vol_ratio = vol_now / vol_avg
+
+            # شرط 1: spike حجم قوي في الـ 15m
+            if vol_ratio < self.cfg.s4_vol_spike_15m:
+                return None
+
+            # شرط 2: RSI في منطقة صحية (لم يتشبع بعد)
+            rsi = calc_rsi(df15["close"])
+            if not (self.cfg.s4_rsi_min <= rsi <= self.cfg.s4_rsi_max):
+                return None
+
+            # شرط 3: السعر لم يرتفع كثيراً بعد (نحن قبل الحركة)
+            prev_close = float(df15["close"].iloc[-3])  # قبل 3 شموع (45 دقيقة)
+            price_move = (price - prev_close) / prev_close * 100 if prev_close > 0 else 99
+            if price_move > self.cfg.s4_price_stable_pct:
+                return None  # تأخرنا، السعر ارتفع مسبقاً
+
+            # شرط 4: حجم تداول يومي كافٍ
+            try:
+                cached = self.ex._tickers_cache or {}
+                t = cached.get(symbol, {})
+                vol_usd = float(t.get("quoteVolume") or 0)
+                if vol_usd < self.cfg.s4_min_vol_usd:
+                    return None
+            except Exception:
+                pass
+
+            # شرط 5: EMA صاعد (ترند إيجابي)
+            ema9  = calc_ema(df15["close"], 9)
+            ema21 = calc_ema(df15["close"], 21)
+            if ema9 < ema21 * 0.998:  # EMA9 يجب أن يكون فوق EMA21
+                return None
+
+            _log(f"[S4🔮] {symbol} تراكم مبكر! vol×{vol_ratio:.1f} RSI={rsi:.0f} move={price_move:.1f}%")
+            return {
+                "strategy": "S4",
+                "rsi": rsi,
+                "gain_pct": price_move,
+                "vol_ratio": vol_ratio,
+                "price": price,
+                "trigger": "early_accumulation",
+            }
+        except Exception as e:
+            _log(f"[S4] ⚠️ {symbol}: {e}")
+            return None
+
     # ─── New Listing Strategy ─────────────────────────────────
     def check_new_listing(self, symbol: str, cfg: Config) -> Optional[dict]:
         """استراتيجية خاصة للعملات الجديدة — دخول فوري مع SL ضيق"""
@@ -1738,6 +1843,14 @@ class StrategyEngine:
             tp1_pct = max(sl_pct * rr_min, atr_pct * 1.5)
             tp2_pct = tp1_pct * 1.5
             tp3_pct = tp2_pct * 1.3
+
+        elif s == "S4":
+            # Early Accumulation: دخلنا مبكراً → نعطي وقتاً أكثر للتطور
+            # أهداف مشابهة لـ S1 لأن الحركة لم تبدأ بعد
+            tp1_pct = max(sl_pct * rr_min, atr_pct * 2.0)
+            tp1_pct = max(4.0, min(12.0, tp1_pct))
+            tp2_pct = tp1_pct * 2.0
+            tp3_pct = tp2_pct * 1.5
 
         elif s == "NEW_LISTING":
             # listing جديد: تذبذب عالٍ جداً → أهداف أكبر
@@ -2613,7 +2726,7 @@ class Orchestrator:
             "📡 <b>مصادر الإشارات:</b>\n"
             f"{'  '.join(sources)}\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "⚡ الاستراتيجيات: S1 RSI | S2 Momentum | S3 Rocket 🚀 | New Listing 🆕\n"
+            "⚡ الاستراتيجيات: S4 Accumulation 🔮 | S1 RSI | S2 Momentum | S3 Rocket 🚀 | New Listing 🆕\n"
             f"🔍 TradeMonitor: كل {self.cfg.monitor_interval}ث (لحظي)\n"
             f"📈 الشهر: {monthly['total']} صفقة | "
             f"P&L: <code>${monthly['pnl']:.2f}</code> | "
@@ -2648,10 +2761,12 @@ class Orchestrator:
                 # عملة جديدة — استراتيجية خاصة
                 signal = self.strategy.check_new_listing(symbol, self.cfg)
             else:
-                # S3 أولاً (الأهم)، ثم S1، ثم S2
-                for checker in [self.strategy.check_s3,
+                # S4 أولاً (تنبؤي 🔮 — قبل الحركة)، S1 ثانياً (ارتداد)،
+                # S2 ثالثاً (momentum مبكر)، S3 أخيراً (رجعي — بعد الحركة)
+                for checker in [self.strategy.check_s4,
                                  self.strategy.check_s1,
-                                 self.strategy.check_s2]:
+                                 self.strategy.check_s2,
+                                 self.strategy.check_s3]:
                     try:
                         signal = await asyncio.get_event_loop().run_in_executor(
                             None, checker, symbol
@@ -2705,8 +2820,8 @@ class Orchestrator:
                     _log(f"[FearGreed] 😱 {fg}/100 Extreme Fear — فرصة ذهبية!")
                     signal["fg_extreme_fear"] = True
 
-            # ── EMA Cross — فلتر اتجاه (يُطبَّق على S1 و S2 فقط، S3 Rocket يُتجاوزه) ──
-            if self.cfg.ema_cross_enabled and signal.get("strategy") in ("S1", "S2"):
+            # ── EMA Cross — فلتر اتجاه (يُطبَّق على S1، S2، S4 — S3 Rocket يُتجاوزه) ──
+            if self.cfg.ema_cross_enabled and signal.get("strategy") in ("S1", "S2", "S4"):
                 try:
                     df1h = await asyncio.get_event_loop().run_in_executor(
                         None, self.ex.fetch_ohlcv, symbol, "1h", 50
@@ -2843,7 +2958,7 @@ class Orchestrator:
                 })
 
             # إشعار Telegram
-            emoji   = {"S3": "🚀", "NEW_LISTING": "🆕", "S1": "📉", "S2": "📈"}.get(signal["strategy"], "📊")
+            emoji   = {"S4": "🔮", "S3": "🚀", "NEW_LISTING": "🆕", "S1": "📉", "S2": "📈"}.get(signal["strategy"], "📊")
             boosts = []
             if signal.get("ob_boost"):          boosts.append("📚 Order Book")
             if signal.get("funding_boost"):     boosts.append("📉 Funding Squeeze")
