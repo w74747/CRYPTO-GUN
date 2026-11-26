@@ -405,31 +405,23 @@ class SlotManager:
 
     @property
     def free(self) -> int:
-        """عدد الصفقات الممكنة بناءً على الرصيد الحر الفعلي"""
-        if self._free_usdt_fn:
-            try:
-                free_usdt = self._free_usdt_fn()
-                slots_possible = int(free_usdt // self._cap)
-                return max(0, min(slots_possible, self._max - self.used))
-            except Exception:
-                pass
+        """عدد الـ slots المتاحة (حد أقصى فقط — الرصيد يُفحص في scan_loop)"""
         return max(0, self._max - self.used)
 
-    def is_vacant(self, symbol: str) -> bool:
+    def can_open(self, symbol: str, free_usdt: float) -> bool:
+        """هل يمكن فتح صفقة جديدة؟ يستقبل الرصيد الحر مباشرة بدون API call.
+        استخدم symbol='__check__' للفحص العام بدون تحقق من الرمز."""
         with self._lock:
-            if symbol in self._slots:
+            if symbol != "__check__" and symbol in self._slots:
                 return False
             if self.used >= self._max:
                 return False
-            # فحص الرصيد الحر
-            if self._free_usdt_fn:
-                try:
-                    free_usdt = self._free_usdt_fn()
-                    if free_usdt < self._cap * 0.8:  # يحتاج 80% على الأقل من حجم الصفقة
-                        return False
-                except Exception:
-                    pass
-            return True
+            return free_usdt >= self._cap * 0.8
+
+    def is_vacant(self, symbol: str) -> bool:
+        """فحص بسيط بدون API — يُستخدم للتحقق السريع فقط"""
+        with self._lock:
+            return symbol not in self._slots and self.used < self._max
 
     def occupy(self, state: SlotState):
         with self._lock:
@@ -2628,10 +2620,12 @@ class Orchestrator:
     async def _process_symbol(self, session: aiohttp.ClientSession,
                                symbol: str, capital: float,
                                signal_source: str = "scan",
-                               force_new_listing: bool = False):
+                               force_new_listing: bool = False,
+                               free_usdt: float = 0.0):
         with self._processing_lock:
             if symbol in self._processing:
                 return
+            # فحص بسيط أولاً (بدون API)
             if not self.slots.is_vacant(symbol):
                 return
             self._processing.add(symbol)
@@ -2764,7 +2758,9 @@ class Orchestrator:
                     _log(f"[AI] ❌ {symbol} رُفض")
                     return
 
-            if not self.slots.is_vacant(symbol):
+            # فحص ثانٍ مع الرصيد الحر (بعد AI approval)
+            check_bal = free_usdt if free_usdt > 0 else self.ex.free_usdt()
+            if not self.slots.can_open(symbol, check_bal):
                 return
 
             # ── تعديل حجم الصفقة بناءً على Fear & Greed + BTC Trend ──
@@ -2925,7 +2921,8 @@ class Orchestrator:
                 _log(f"🔄 Scan #{scan_count} | صفقات={self.slots.used} | رصيد_حر=${balance:.2f} | يمكن_فتح={slots_possible}")
                 _log(f"[Balance] ${balance:.2f} | حصة/صفقة: ${capital:.2f}")
 
-                if self.slots.free == 0:
+                _log(f"[Debug] slots_possible={slots_possible} balance={balance:.4f} capital={capital:.4f} thresh={capital*0.8:.4f} cond1={slots_possible==0} cond2={balance < capital*0.8}")
+                if slots_possible == 0 or balance < capital * 0.8:
                     _log(f"[Scan] رصيد حر ${balance:.2f} < ${capital:.2f} — انتظار")
                 elif balance < capital * 0.5 and self.slots.used == 0:
                     _log(f"[Scan] رصيد ${balance:.2f} منخفض جداً")
@@ -2971,12 +2968,13 @@ class Orchestrator:
                     try:
                         binance_new = await self.binance.check(session)
                         for sym in binance_new:
-                            if self.slots.is_vacant(sym):
+                            if self.slots.can_open(sym, balance):
                                 _log(f"[Binance📢] 🔥 شراء فوري: {sym}")
                                 await self._process_symbol(
                                     session, sym, capital,
                                     signal_source="binance_listing",
-                                    force_new_listing=True
+                                    force_new_listing=True,
+                                    free_usdt=balance
                                 )
                     except Exception as e:
                         _log(f"[Binance📢] ⚠️ {e}")
@@ -3016,13 +3014,13 @@ class Orchestrator:
                             _log(f"[BTCFilter] ⚠️ {e}")
 
                     # 2a. SAFE_COINS أولاً — شراء مباشر بدون فلاتر
-                    if self.slots.free > 0:
+                    if slots_possible > 0:
                         _log("[SafeScan] 🛡️ فحص SAFE_COINS أولاً...")
                         try:
                             # جلب tickers مباشر لـ SAFE_COINS (لا نعتمد على cache)
                             safe_symbols = [s for s in self.ex.SAFE_COINS
                                            if s.replace("/USDT","") not in self.ex._geo_blocked
-                                           and self.slots.is_vacant(s)]
+                                           and self.slots.can_open(s, balance)]
                             live_tickers = {}
                             if safe_symbols:
                                 try:
@@ -3048,9 +3046,9 @@ class Orchestrator:
                             if safe_candidates:
                                 _log(f"[SafeScan] ✅ {len(safe_candidates)} SAFE_COIN — أعلاها: {safe_candidates[0][0]} {safe_candidates[0][1]:.1f}%")
                                 for sym, pct, price_s in safe_candidates[:2]:
-                                    if self.slots.free == 0:
+                                    if not self.slots.can_open(sym, balance):
                                         break
-                                    if not self.slots.is_vacant(sym):
+                                    if not self.slots.can_open(sym, balance):
                                         continue
                                     _log(f"[SafeScan] 🛒 شراء مباشر: {sym} @ {price_s:.6g} gain={pct:.1f}%")
                                     result = await asyncio.get_event_loop().run_in_executor(
@@ -3118,13 +3116,14 @@ class Orchestrator:
                         # فحص العملات ذات الأولوية العالية — batch صغير لتجنب pool overflow
                         BATCH = 5
                         for i in range(0, len(priority_syms), BATCH):
-                            if self.slots.free == 0:
+                            if not self.slots.can_open("__check__", balance):
                                 break
                             batch = priority_syms[i:i+BATCH]
                             tasks = [
                                 self._process_symbol(
                                     session, sym, capital,
-                                    signal_source=f"priority_score_{score:.0f}"
+                                    signal_source=f"priority_score_{score:.0f}",
+                                    free_usdt=balance
                                 )
                                 for sym, score in batch
                             ]
@@ -3143,11 +3142,11 @@ class Orchestrator:
                             random.shuffle(symbols)
                             BATCH = 20
                             for i in range(0, min(len(symbols), 200), BATCH):
-                                if self.slots.free == 0:
+                                if not self.slots.can_open("__check__", balance):
                                     break
                                 batch = symbols[i:i+BATCH]
                                 tasks = [
-                                    self._process_symbol(session, sym, capital)
+                                    self._process_symbol(session, sym, capital, free_usdt=balance)
                                     for sym in batch
                                 ]
                                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -3160,14 +3159,15 @@ class Orchestrator:
                         new_listings_check_tick = 0
                         new_syms = self.signals._new_listings_seen.copy()
                         for sym in new_syms:
-                            if self.slots.free == 0:
+                            if not self.slots.can_open(sym, balance):
                                 break
                             if self.slots.get(sym):
                                 continue
                             await self._process_symbol(
                                 session, sym, capital,
                                 signal_source="new_listing",
-                                force_new_listing=True
+                                force_new_listing=True,
+                                free_usdt=balance
                             )
 
                 # (Smart Report معطّل — إشعارات الصفقات فقط)
