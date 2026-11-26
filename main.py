@@ -1934,7 +1934,7 @@ class TradeMonitor:
             await self._close_position(state, price, "sl")
             return
 
-        if state.tp1_order_id:
+        if state.tp1_order_id and not state.partial1_done:
             status = await asyncio.get_event_loop().run_in_executor(
                 None, self.ex.order_status, state.symbol, state.tp1_order_id
             )
@@ -1942,7 +1942,7 @@ class TradeMonitor:
                 _log(f"[Monitor] 🎯 TP1 {state.symbol}")
                 await self._on_tp1_filled(state, state.tp1_price)
                 return
-        elif price >= state.tp1_price > 0 and not state.partial1_done:
+        elif not state.tp1_order_id and price >= state.tp1_price > 0 and not state.partial1_done:
             _log(f"[Monitor] 🎯 TP1 سعر {state.symbol}")
             await self._on_tp1_filled(state, price)
             return
