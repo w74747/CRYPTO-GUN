@@ -1897,8 +1897,11 @@ class TradeMonitor:
         )
         # استخدم الرصيد الفعلي (free+used) إذا كان متاحاً، وإلا استخدم qty من الذاكرة
         check_val = actual_val if actual_val >= 0 else (qty * price)
-        if check_val < 1.0 and qty > 0 and not state.tp1_order_id:
-            _log(f"[Monitor] 🧹 {state.symbol} غبار (val=${check_val:.4f} < $1) → إغلاق تلقائي")
+        # ── إغلاق الغبار: أقل من $1 مطلقاً، أو أقل من 20% من رأس المال (صفقة قديمة ميتة) ──
+        cap_per_slot = max(self.cfg.min_capital_usd, (self.ex.fetch_usdt_balance() + state.capital) / max(self.cfg.max_slots, 1))
+        is_old_dust = (check_val < cap_per_slot * 0.20) and not state.tp1_order_id and (state.capital > 0) and (check_val < state.capital * 0.25)
+        if (check_val < 1.0 or is_old_dust) and qty > 0 and not state.tp1_order_id:
+            _log(f"[Monitor] 🧹 {state.symbol} غبار (val=${check_val:.4f} cap=${state.capital:.1f}) → تحرير slot")
             if state.db_trade_id:
                 pnl_pct_d = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
                 pnl_usd_d = (price - state.entry_price) * qty if state.entry_price else 0
@@ -2313,7 +2316,7 @@ class AutoHeal:
                     except Exception:
                         pass
 
-                if val < cap_per_slot * 0.15 and not tp1_id:
+                if val < cap_per_slot * 0.30 and not tp1_id:
                     self.db.close_trade(t["id"], price or float(t.get("entry_price", 0)),
                                         0, "heal_dust", 0, 0)
                     actions.append(f"🧹 {sym}: أتربة (${val:.2f}) → أُغلق")
