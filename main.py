@@ -50,9 +50,10 @@ class Config:
     database_url:       str   = field(default_factory=lambda: os.environ.get("DATABASE_URL", ""))
     fallback_db_url:    str   = field(default_factory=lambda: os.environ.get("FALLBACK_DATABASE_URL", ""))
 
-    # ── رأس المال (ديناميكي: 0 = رصيد ÷ slots) ──
+    # ── رأس المال (ديناميكي: يفتح صفقات بحدود capital_per_trade من الرصيد الحر) ──
     capital:            float = field(default_factory=lambda: float(os.environ.get("TRADE_INVESTMENT_AMOUNT", "0")))
-    max_slots:          int   = field(default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_TRADES", "3")))
+    capital_per_trade:  float = field(default_factory=lambda: float(os.environ.get("CAPITAL_PER_TRADE", "40")))
+    max_slots:          int   = field(default_factory=lambda: int(os.environ.get("MAX_CONCURRENT_TRADES", "10")))  # حد أقصى للأمان فقط
 
     # ── توقيت ──
     scan_interval_min:  int   = field(default_factory=lambda: int(os.environ.get("SCAN_INTERVAL_MINUTES", "1")))
@@ -391,9 +392,11 @@ class SlotState:
 
 
 class SlotManager:
-    def __init__(self, max_slots: int):
+    def __init__(self, max_slots: int, capital_per_trade: float = 40.0):
         self._slots: dict[str, SlotState] = {}
-        self._max   = max_slots
+        self._max   = max_slots          # حد أقصى مطلق للأمان
+        self._cap   = capital_per_trade  # حجم كل صفقة بالـ USDT
+        self._free_usdt_fn = None        # دالة تُعيد الرصيد الحر (تُضبط من Orchestrator)
         self._lock  = threading.Lock()
 
     @property
@@ -402,11 +405,31 @@ class SlotManager:
 
     @property
     def free(self) -> int:
-        return self._max - self.used
+        """عدد الصفقات الممكنة بناءً على الرصيد الحر الفعلي"""
+        if self._free_usdt_fn:
+            try:
+                free_usdt = self._free_usdt_fn()
+                slots_possible = int(free_usdt // self._cap)
+                return max(0, min(slots_possible, self._max - self.used))
+            except Exception:
+                pass
+        return max(0, self._max - self.used)
 
     def is_vacant(self, symbol: str) -> bool:
         with self._lock:
-            return symbol not in self._slots and self.used < self._max
+            if symbol in self._slots:
+                return False
+            if self.used >= self._max:
+                return False
+            # فحص الرصيد الحر
+            if self._free_usdt_fn:
+                try:
+                    free_usdt = self._free_usdt_fn()
+                    if free_usdt < self._cap * 0.8:  # يحتاج 80% على الأقل من حجم الصفقة
+                        return False
+                except Exception:
+                    pass
+            return True
 
     def occupy(self, state: SlotState):
         with self._lock:
@@ -1898,7 +1921,7 @@ class TradeMonitor:
         # استخدم الرصيد الفعلي (free+used) إذا كان متاحاً، وإلا استخدم qty من الذاكرة
         check_val = actual_val if actual_val >= 0 else (qty * price)
         # ── إغلاق الغبار: أقل من $1 مطلقاً، أو أقل من 20% من رأس المال (صفقة قديمة ميتة) ──
-        cap_per_slot = (self.ex.fetch_usdt_balance() + state.capital) / max(self.cfg.max_slots, 1)
+        cap_per_slot = self.cfg.capital_per_trade
         is_old_dust = (check_val < cap_per_slot * 0.20) and (state.capital > 0) and (check_val < state.capital * 0.25)
         if check_val < 1.0 or is_old_dust:
             # إلغاء أوردر TP1 المفتوح إن وُجد قبل إغلاق الصفقة
@@ -2517,10 +2540,7 @@ class AutoHeal:
         if self.cfg.capital > 0:
             return self.cfg.capital
         # في AutoHeal: استخدام إجمالي الرصيد المقدر
-        free = self.ex.free_usdt()
-        invested = sum(s.capital for s in self.slots.all())
-        total = free + invested
-        return max(1.0, round(total / max(1, self.cfg.max_slots), 2))
+        return self.cfg.capital_per_trade
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2531,7 +2551,8 @@ class Orchestrator:
         self.cfg       = cfg
         self.db        = TradeDB(cfg.database_url, cfg.fallback_db_url)
         self.ex        = Executor(cfg)
-        self.slots     = SlotManager(cfg.max_slots)
+        self.slots     = SlotManager(cfg.max_slots, cfg.capital_per_trade)
+        self.slots._free_usdt_fn = self.ex.free_usdt  # ربط الرصيد الحر الديناميكي
         self.monitor   = TradeMonitor(cfg, self.ex, self.slots, self.db)
         self.strategy  = StrategyEngine(cfg, self.ex)
         self.ai        = AIAdvisor(cfg)
@@ -2550,14 +2571,14 @@ class Orchestrator:
     def _calc_capital(self) -> float:
         if self.cfg.capital > 0:
             return self.cfg.capital
-        # حساب إجمالي الرصيد = حر + مستثمر في الصفقات المفتوحة
+        # حجم الصفقة = CAPITAL_PER_TRADE ثابت (40 USDT افتراضياً)
+        # البوت يفتح صفقات طالما الرصيد الحر >= capital_per_trade
         free = self.ex.free_usdt()
         invested = sum(s.capital for s in self.slots.all())
         total = free + invested
-        per_slot = total / max(1, self.cfg.max_slots)
-        result = max(1.0, round(per_slot, 2))
-        _log(f"[Capital] free=${free:.2f} invested=${invested:.2f} total=${total:.2f} per_slot=${result:.2f}")
-        return result
+        cap = self.cfg.capital_per_trade
+        _log(f"[Capital] free=${free:.2f} invested=${invested:.2f} total=${total:.2f} per_slot=${cap:.2f}")
+        return cap
 
     async def _send_tg(self, text: str, msg_type: str = "misc"):
         await tg_send(self.cfg.telegram_token, self.cfg.telegram_chat_id, text, msg_type)
@@ -2898,14 +2919,14 @@ class Orchestrator:
 
             while True:
                 scan_count += 1
-                _log(f"🔄 Scan #{scan_count} | slots={self.slots.used}/{self.cfg.max_slots}")
-
                 balance = self.ex.free_usdt()
                 capital = self._calc_capital()
+                slots_possible = int(balance // capital) if capital > 0 else 0
+                _log(f"🔄 Scan #{scan_count} | صفقات={self.slots.used} | رصيد_حر=${balance:.2f} | يمكن_فتح={slots_possible}")
                 _log(f"[Balance] ${balance:.2f} | حصة/صفقة: ${capital:.2f}")
 
                 if self.slots.free == 0:
-                    _log("[Scan] كل الـ slots مشغولة — انتظار")
+                    _log(f"[Scan] رصيد حر ${balance:.2f} < ${capital:.2f} — انتظار")
                 elif balance < capital * 0.5 and self.slots.used == 0:
                     _log(f"[Scan] رصيد ${balance:.2f} منخفض جداً")
                     # تنبيه للمستخدم بضرورة شحن الرصيد (مرة واحدة كل ساعة)
