@@ -1898,9 +1898,18 @@ class TradeMonitor:
         # استخدم الرصيد الفعلي (free+used) إذا كان متاحاً، وإلا استخدم qty من الذاكرة
         check_val = actual_val if actual_val >= 0 else (qty * price)
         # ── إغلاق الغبار: أقل من $1 مطلقاً، أو أقل من 20% من رأس المال (صفقة قديمة ميتة) ──
-        cap_per_slot = max(self.cfg.min_capital_usd, (self.ex.fetch_usdt_balance() + state.capital) / max(self.cfg.max_slots, 1))
-        is_old_dust = (check_val < cap_per_slot * 0.20) and not state.tp1_order_id and (state.capital > 0) and (check_val < state.capital * 0.25)
-        if (check_val < 1.0 or is_old_dust) and qty > 0 and not state.tp1_order_id:
+        cap_per_slot = (self.ex.fetch_usdt_balance() + state.capital) / max(self.cfg.max_slots, 1)
+        is_old_dust = (check_val < cap_per_slot * 0.20) and (state.capital > 0) and (check_val < state.capital * 0.25)
+        if check_val < 1.0 or is_old_dust:
+            # إلغاء أوردر TP1 المفتوح إن وُجد قبل إغلاق الصفقة
+            if state.tp1_order_id:
+                try:
+                    self.ex.exchange.cancel_order(state.tp1_order_id, state.symbol)
+                    _log(f"[Monitor] 🧹 {state.symbol} إلغاء TP1 order غبار ({state.tp1_order_id[:8]})")
+                except Exception:
+                    pass
+                self.slots.update(state.symbol, tp1_order_id="")
+        if (check_val < 1.0 or is_old_dust) and qty > 0:
             _log(f"[Monitor] 🧹 {state.symbol} غبار (val=${check_val:.4f} cap=${state.capital:.1f}) → تحرير slot")
             if state.db_trade_id:
                 pnl_pct_d = (price - state.entry_price) / state.entry_price * 100 if state.entry_price else 0
