@@ -150,6 +150,15 @@ class Config:
     coingecko_gainers_enabled: bool = field(default_factory=lambda: os.environ.get("COINGECKO_GAINERS_ENABLED", "true").lower() == "true")
     coingecko_gainers_hours:   float = field(default_factory=lambda: float(os.environ.get("COINGECKO_GAINERS_HOURS", "1.0")))  # تحديث كل ساعة
 
+    # ── Small Cap Volume Spike — اكتشاف العملات الصغيرة المبكر ──
+    small_cap_enabled:    bool  = field(default_factory=lambda: os.environ.get("SMALL_CAP_ENABLED", "true").lower() == "true")
+    small_cap_max_vol:    float = field(default_factory=lambda: float(os.environ.get("SMALL_CAP_MAX_VOL_USD", "2000000")))   # حجم يومي أقصى $2M
+    small_cap_min_vol:    float = field(default_factory=lambda: float(os.environ.get("SMALL_CAP_MIN_VOL_USD", "30000")))    # حجم يومي أدنى $30K
+    small_cap_spike:      float = field(default_factory=lambda: float(os.environ.get("SMALL_CAP_SPIKE", "3.0")))            # ارتفاع الحجم ×3
+    small_cap_min_gain:   float = field(default_factory=lambda: float(os.environ.get("SMALL_CAP_MIN_GAIN", "1.5")))         # ارتفاع سعري ≥ 1.5%
+    small_cap_max_gain:   float = field(default_factory=lambda: float(os.environ.get("SMALL_CAP_MAX_GAIN", "10.0")))        # ارتفاع سعري ≤ 10% (لم يتشبع بعد)
+    small_cap_count:      int   = field(default_factory=lambda: int(os.environ.get("SMALL_CAP_COUNT", "30")))
+
     # ── قائمة سوداء ──
     blacklisted_assets: set = field(default_factory=lambda: {
         "AAVE","COMP","MKR","CRV","LDO","UNI","SUSHI","BAL","CAKE","YFI",
@@ -766,6 +775,78 @@ class Executor:
             _log(f"[VolumeAnomaly] ❌ {e}")
             return []
 
+    def fetch_small_cap_spikes(self,
+                               max_vol_usd: float = 2_000_000,
+                               min_vol_usd: float = 30_000,
+                               spike_ratio: float = 3.0,
+                               min_gain:    float = 1.5,
+                               max_gain:    float = 10.0,
+                               count:       int   = 30) -> list[str]:
+        """
+        يكتشف العملات الصغيرة (حجم يومي $30K–$2M) التي:
+        - ارتفع حجمها × spike_ratio في آخر ساعة
+        - ارتفع سعرها min_gain% → max_gain% (لم تتشبع بعد)
+        → يلتقط TLM وأمثالها في بداية الحركة قبل القنوات بـ 15-30 دقيقة
+        """
+        _TOKENIZED_SUFFIXES = ("ON", "STOCK", "X")
+        def _is_tokenized(sym: str) -> bool:
+            base = sym.replace("/USDT", "")
+            return any(base.endswith(s) and len(base) > len(s) + 2
+                       for s in _TOKENIZED_SUFFIXES)
+        try:
+            cached = self._tickers_cache or {}
+            if not cached:
+                cached = self.exchange.fetch_tickers()
+                self._tickers_cache = cached
+
+            candidates = []
+            for symbol, t in cached.items():
+                if not symbol.endswith("/USDT"):
+                    continue
+                if _is_tokenized(symbol):
+                    continue
+                base = symbol.replace("/USDT", "")
+                if base in self._geo_blocked or base in [
+                    b.replace("/USDT", "") for b in self.SAFE_COINS
+                ]:
+                    continue  # SAFE_COINS لها مسار منفصل
+
+                vol_24h = float(t.get("quoteVolume") or 0)
+                # نريد العملات الصغيرة فقط
+                if not (min_vol_usd <= vol_24h <= max_vol_usd):
+                    continue
+
+                gain = float(t.get("percentage") or t.get("change") or 0)
+                # في نطاق الارتفاع المبكر (لم تتشبع، لم تبدأ بعد)
+                if not (min_gain <= gain <= max_gain):
+                    continue
+
+                # حجم آخر ساعة (تقدير = vol_24h / 24 × نسبة الحركة)
+                # إذا لم يتوفر vol_1h مباشرة، نستخدم info
+                info = t.get("info") or {}
+                vol_1h = float(info.get("volume", 0) or 0)
+                avg_hourly = vol_24h / 24.0
+
+                if vol_1h > 0:
+                    ratio = vol_1h / avg_hourly if avg_hourly > 0 else 0
+                else:
+                    # تقدير: إذا كان الـ gain قوياً + vol مرتفع → على الأرجح spike
+                    ratio = (gain / 3.0)  # تقدير محافظ
+
+                if ratio >= spike_ratio:
+                    candidates.append((symbol, ratio, gain, vol_24h))
+
+            # ترتيب: أعلى ratio×gain (الأقوى والأمكر)
+            candidates.sort(key=lambda x: x[1] * x[2], reverse=True)
+            result = [s for s, _, _, _ in candidates[:count]]
+            if result:
+                _log(f"[SmallCap] 🔭 {len(result)} عملة صغيرة بحجم شاذ | "
+                     f"مثال: {candidates[0][0]} ×{candidates[0][1]:.1f} +{candidates[0][2]:.1f}%")
+            return result
+        except Exception as e:
+            _log(f"[SmallCap] ❌ {e}")
+            return []
+
     def fetch_new_listings(self, known_symbols: set) -> list[str]:
         """
         يكتشف العملات المدرجة حديثاً بمقارنة قائمة الأسواق الحالية بالمعروفة.
@@ -1093,13 +1174,28 @@ class SignalAggregator:
                     candidates[mexc_sym] = candidates.get(mexc_sym, 0) + 15  # وزن عالٍ جداً!
                     _log(f"[Whale🐳] {mexc_sym}: تراكم ضخم → وزن +15")
 
-        # 7. SAFE_COINS — مضمونة التداول، أضفها دائماً بوزن متوسط
+        # 7. Small Cap Volume Spike — العملات الصغيرة المتحركة مبكراً
+        small_cap_syms = []
+        if self.cfg.small_cap_enabled:
+            small_cap_syms = await asyncio.get_event_loop().run_in_executor(
+                None, self.ex.fetch_small_cap_spikes,
+                self.cfg.small_cap_max_vol,
+                self.cfg.small_cap_min_vol,
+                self.cfg.small_cap_spike,
+                self.cfg.small_cap_min_gain,
+                self.cfg.small_cap_max_gain,
+                self.cfg.small_cap_count,
+            )
+            for sym in small_cap_syms:
+                candidates[sym] = candidates.get(sym, 0) + 12  # وزن مرتفع — اكتشاف مبكر
+
+        # 8. SAFE_COINS — مضمونة التداول، أضفها دائماً بوزن متوسط
         for sym in self.ex.SAFE_COINS:
             base = sym.replace("/USDT", "")
             if base not in self.ex._geo_blocked:
                 candidates[sym] = candidates.get(sym, 0) + 3  # وزن منخفض كـ fallback
 
-        # 8. تحديث القائمة المدمجة
+        # 9. تحديث القائمة المدمجة
         with self._lock:
             self._candidates = candidates
 
@@ -1108,6 +1204,7 @@ class SignalAggregator:
         if total:
             _log(f"[SignalAgg] 📡 {total} مرشح | "
                  f"Gainers:{len(gainers) if self.cfg.top_gainers_enabled else 0} "
+                 f"SmallCap:{len(small_cap_syms)} "
                  f"Trending:{len(self._trending_coins)} "
                  f"New:{len(self._new_listings_seen)} "
                  f"Whale:{whale_count}")
@@ -3184,6 +3281,8 @@ class Orchestrator:
             sources.append("🐳 Whale Alert")
         if self.cfg.coingecko_gainers_enabled:
             sources.append("📈 CoinGecko Gainers")
+        if self.cfg.small_cap_enabled:
+            sources.append("🔭 Small Cap Spikes")
 
         text = (
             "🚀 <b>MEXC Scalping Bot v5 — Ultra Rocket Edition</b>\n"
