@@ -2866,6 +2866,245 @@ class AutoHeal:
 
 
 # ══════════════════════════════════════════════════════════════
+# TELEGRAM COMMAND HANDLER — /check <SYMBOL>
+# ══════════════════════════════════════════════════════════════
+class TelegramCommandHandler:
+    """
+    يستقبل أوامر من Telegram عبر polling ويُنفّذها:
+    /check TLM  → يفحص العملة بكل الأدوات ويُرسل تقريراً
+    /check TLM/USDT → نفسه
+    /status     → عدد الصفقات المفتوحة والرصيد
+    /slots      → تفاصيل الصفقات المفتوحة
+    """
+    POLL_URL = "https://api.telegram.org/bot{token}/getUpdates"
+    SEND_URL = "https://api.telegram.org/bot{token}/sendMessage"
+
+    def __init__(self, cfg: Config, ex: Executor, slots: SlotManager,
+                 db: TradeDB, strategy: "StrategyEngine"):
+        self.cfg      = cfg
+        self.ex       = ex
+        self.slots    = slots
+        self.db       = db
+        self.strategy = strategy
+        self._offset  = 0
+        self._running = False
+
+    async def start(self, session: aiohttp.ClientSession):
+        """يبدأ polling الأوامر من Telegram"""
+        self._running = True
+        _log("[TGCmd] 🤖 بدأ استقبال الأوامر...")
+        while self._running:
+            try:
+                await self._poll(session)
+            except Exception as e:
+                _log(f"[TGCmd] ⚠️ {e}")
+            await asyncio.sleep(5)  # polling كل 5 ثانية
+
+    def stop(self):
+        self._running = False
+
+    async def _poll(self, session: aiohttp.ClientSession):
+        url = self.POLL_URL.format(token=self.cfg.telegram_token)
+        params = {"offset": self._offset, "timeout": 4, "limit": 10,
+                  "allowed_updates": ["message"]}
+        async with session.get(url, params=params,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return
+            data = await r.json()
+            updates = data.get("result", [])
+            for upd in updates:
+                self._offset = upd["update_id"] + 1
+                msg = upd.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                text    = msg.get("text", "").strip()
+                # فقط من المستخدم المصرّح
+                if chat_id != str(self.cfg.telegram_chat_id):
+                    continue
+                if text:
+                    await self._handle(session, chat_id, text)
+
+    async def _handle(self, session: aiohttp.ClientSession, chat_id: str, text: str):
+        """يُعالج الأمر ويُرسل الرد"""
+        cmd = text.split()[0].lower().split("@")[0]  # /check@botname → /check
+        args = text.split()[1:]
+
+        if cmd == "/check" and args:
+            sym_input = args[0].upper().replace("-", "/")
+            if "/" not in sym_input:
+                sym_input = f"{sym_input}/USDT"
+            await self._cmd_check(session, chat_id, sym_input)
+
+        elif cmd == "/status":
+            await self._cmd_status(session, chat_id)
+
+        elif cmd == "/slots":
+            await self._cmd_slots(session, chat_id)
+
+        elif cmd == "/help":
+            await self._send(session, chat_id,
+                "🤖 <b>أوامر البوت:</b>\n"
+                "/check TLM — فحص عملة من توصية\n"
+                "/status — الرصيد والصفقات المفتوحة\n"
+                "/slots — تفاصيل الصفقات الحالية\n"
+                "/help — هذه القائمة")
+
+    async def _cmd_check(self, session: aiohttp.ClientSession, chat_id: str, symbol: str):
+        """فحص عملة بكل الأدوات المتاحة"""
+        await self._send(session, chat_id, f"🔍 جاري فحص <b>{symbol}</b>...")
+        try:
+            # 1. تحقق من وجود العملة على MEXC
+            if symbol not in self.ex.exchange.markets:
+                # حاول تحديث السوق
+                try:
+                    self.ex.exchange.load_markets(reload=True)
+                except Exception:
+                    pass
+            if symbol not in self.ex.exchange.markets:
+                await self._send(session, chat_id,
+                    f"❌ <b>{symbol}</b> غير متاحة على MEXC للتداول الآن.")
+                return
+
+            # 2. جلب البيانات
+            price  = self.ex.live_price(symbol)
+            ticker = self.ex.exchange.fetch_ticker(symbol)
+            change_24h = float(ticker.get("percentage") or 0)
+            vol_24h    = float(ticker.get("quoteVolume") or 0)
+
+            # 3. RSI + EMA
+            df1h = self.ex.fetch_ohlcv(symbol, "1h", 50)
+            df15 = self.ex.fetch_ohlcv(symbol, "15m", 50)
+            rsi_1h = rsi_15 = ema_note = "N/A"
+            if df1h is not None and len(df1h) >= 15:
+                rsi_1h = round(calc_rsi(df1h["close"]), 1)
+                ema9  = calc_ema(df1h["close"], 9)
+                ema21 = calc_ema(df1h["close"], 21)
+                ema_note = "📈 صاعد" if ema9 > ema21 else "📉 هابط"
+            if df15 is not None and len(df15) >= 15:
+                rsi_15 = round(calc_rsi(df15["close"]), 1)
+
+            # 4. Volume spike
+            vol_note = "N/A"
+            if df15 is not None and len(df15) >= 20:
+                vol_now = float(df15["vol"].iloc[-1])
+                vol_avg = float(df15["vol"].iloc[-20:-1].mean())
+                vol_ratio = vol_now / vol_avg if vol_avg > 0 else 0
+                vol_note = f"×{vol_ratio:.1f} {'🔥' if vol_ratio >= 2 else '🟡' if vol_ratio >= 1.2 else '😴'}"
+
+            # 5. Order Book pressure
+            ob_ratio = self.ex.get_orderbook_pressure(symbol)
+            ob_note = f"{ob_ratio:.2f} {'✅ شراء' if ob_ratio >= 0.5 else '⚠️ بيع'}"
+
+            # 6. فحص الاستراتيجيات
+            sig_results = []
+            for name, checker in [
+                ("S4 🔮 Accumulation", self.strategy.check_s4),
+                ("S1 RSI Bounce",      self.strategy.check_s1),
+                ("S2 Volume Break",    self.strategy.check_s2),
+                ("S3 Momentum",        self.strategy.check_s3),
+            ]:
+                try:
+                    r = checker(symbol)
+                    if r:
+                        sig_results.append(f"✅ <b>{name}</b> — gain={r.get('gain_pct',0):.1f}%")
+                    else:
+                        sig_results.append(f"⬜ {name}")
+                except Exception:
+                    sig_results.append(f"⬜ {name}")
+
+            # 7. حكم نهائي
+            has_signal = any("✅" in s for s in sig_results)
+            rsi_ok = isinstance(rsi_1h, float) and 30 <= rsi_1h <= 65
+            vol_ok = "🔥" in vol_note or "🟡" in vol_note
+            ob_ok  = ob_ratio >= 0.4
+
+            score = sum([has_signal, rsi_ok, vol_ok, ob_ok])
+            if score >= 3:
+                verdict = "🟢 <b>فرصة جيدة</b> — يستحق الدخول"
+            elif score == 2:
+                verdict = "🟡 <b>محايد</b> — انتظر تأكيداً إضافياً"
+            else:
+                verdict = "🔴 <b>لا تُوصي</b> — الظروف غير مناسبة الآن"
+
+            # 8. بناء الرد
+            lines = [
+                f"📊 <b>تقرير فحص: {symbol}</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"💰 السعر: <code>{price:.6g}</code>",
+                f"📈 تغيّر 24h: <code>{change_24h:+.2f}%</code>",
+                f"💧 حجم 24h: <code>${vol_24h/1e6:.1f}M</code>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"📐 RSI 1h: <code>{rsi_1h}</code> | RSI 15m: <code>{rsi_15}</code>",
+                f"🔀 EMA (9/21): {ema_note}",
+                f"🌊 Volume Spike: {vol_note}",
+                f"📚 Order Book: {ob_note}",
+                "━━━━━━━━━━━━━━━━━━━━",
+                "<b>الاستراتيجيات:</b>",
+            ] + sig_results + [
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"🏁 الحكم: {verdict}",
+            ]
+            await self._send(session, chat_id, "\n".join(lines))
+
+        except Exception as e:
+            _log(f"[TGCmd] /check {symbol}: {e}")
+            await self._send(session, chat_id, f"⚠️ خطأ في فحص {symbol}: {str(e)[:100]}")
+
+    async def _cmd_status(self, session: aiohttp.ClientSession, chat_id: str):
+        """يُرسل ملخص الوضع الحالي"""
+        try:
+            balance  = self.ex.free_usdt()
+            invested = sum(s.capital for s in self.slots.all())
+            monthly  = self.db.get_monthly_summary()
+            open_trades = self.slots.all()
+            lines = [
+                "📊 <b>حالة البوت</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"💼 رصيد حر: <code>${balance:.2f}</code>",
+                f"📦 مستثمر: <code>${invested:.2f}</code>",
+                f"🔢 صفقات مفتوحة: <code>{self.slots.used}</code>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"📅 هذا الشهر: {monthly['total']} صفقة",
+                f"💰 P&L: <code>${monthly['pnl']:.2f}</code>",
+                f"🎯 Win Rate: <code>{monthly['winrate']}%</code>",
+            ]
+            await self._send(session, chat_id, "\n".join(lines))
+        except Exception as e:
+            await self._send(session, chat_id, f"⚠️ {e}")
+
+    async def _cmd_slots(self, session: aiohttp.ClientSession, chat_id: str):
+        """تفاصيل الصفقات المفتوحة"""
+        try:
+            trades = self.slots.all()
+            if not trades:
+                await self._send(session, chat_id, "📭 لا توجد صفقات مفتوحة حالياً.")
+                return
+            lines = ["📋 <b>الصفقات المفتوحة:</b>", "━━━━━━━━━━━━━━━━━━━━"]
+            for t in trades:
+                price  = self.ex.live_price(t.symbol)
+                pnl    = (price - t.entry_price) / t.entry_price * 100 if t.entry_price > 0 else 0
+                emoji  = "🟢" if pnl > 0 else "🔴"
+                lines.append(
+                    f"{emoji} <b>{t.symbol}</b> [{t.strategy}]\n"
+                    f"   دخول: {t.entry_price:.6g} | الآن: {price:.6g} | P&L: {pnl:+.1f}%\n"
+                    f"   SL: {t.sl_price:.6g} | TP1: {t.tp1_price:.6g}"
+                )
+            await self._send(session, chat_id, "\n".join(lines))
+        except Exception as e:
+            await self._send(session, chat_id, f"⚠️ {e}")
+
+    async def _send(self, session: aiohttp.ClientSession, chat_id: str, text: str):
+        """يُرسل رداً مباشراً (بدون queue — استجابة فورية للأوامر)"""
+        try:
+            url = self.SEND_URL.format(token=self.cfg.telegram_token)
+            await session.post(url,
+                json={"chat_id": chat_id, "text": text[:4000], "parse_mode": "HTML"},
+                timeout=aiohttp.ClientTimeout(total=15))
+        except Exception as e:
+            _log(f"[TGCmd] send error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
 # ORCHESTRATOR
 # ══════════════════════════════════════════════════════════════
 class Orchestrator:
@@ -2898,6 +3137,10 @@ class Orchestrator:
         self._session_bought: dict[str, float] = {}  # symbol -> timestamp آخر شراء
         self.monitor   = TradeMonitor(cfg, self.ex, self.slots, self.db,
                                       closed_cooldown=self._closed_cooldown)
+        # /check و /status و /slots عبر Telegram
+        self.tg_cmd    = TelegramCommandHandler(
+            cfg, self.ex, self.slots, self.db, self.strategy
+        )
 
     def _calc_capital(self) -> float:
         if self.cfg.capital > 0:
@@ -3613,12 +3856,16 @@ class Orchestrator:
         # لا إشعار عند البداية — فقط صفقات وتنبيهات مهمة
         _log("[TG] ✅ Bot بدأ — إشعارات الصفقات فقط")
 
-        monitor_task = asyncio.create_task(self.monitor.start())
-        try:
-            await self.scan_loop()
-        finally:
-            self.monitor.stop()
-            monitor_task.cancel()
+        async with aiohttp.ClientSession() as tg_session:
+            monitor_task  = asyncio.create_task(self.monitor.start())
+            tg_cmd_task   = asyncio.create_task(self.tg_cmd.start(tg_session))
+            try:
+                await self.scan_loop()
+            finally:
+                self.monitor.stop()
+                self.tg_cmd.stop()
+                monitor_task.cancel()
+                tg_cmd_task.cancel()
 
 
 # ══════════════════════════════════════════════════════════════
