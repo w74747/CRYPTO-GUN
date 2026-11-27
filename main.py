@@ -2450,6 +2450,18 @@ class AutoHeal:
                             if isinstance(v, dict) and
                             (float(v.get("free", 0)) + float(v.get("used", 0))) > 0}
             db_symbols   = {t["symbol"] for t in db_trades}
+            # الصفقات المغلقة حديثاً كـ DUST — لا نُعيد تسجيلها
+            dust_symbols: set = set()
+            try:
+                dust_rows = self.db.execute(
+                    "SELECT DISTINCT symbol FROM trades WHERE strategy='DUST' "
+                    "AND closed_at > NOW() - INTERVAL '24 hours'",
+                    fetch=True
+                )
+                if dust_rows:
+                    dust_symbols = {r["symbol"] for r in dust_rows}
+            except Exception:
+                pass
 
             for t in db_trades:
                 sym   = t["symbol"]
@@ -2545,22 +2557,46 @@ class AutoHeal:
                 price = self.ex.live_price(sym)
                 val   = qty * price
                 # إذا كانت قيمة أقل من $1.50 — غبار → بيع فوري (إذا ≥ $1 للحد الأدنى)
-                if 0 < val < 1.50 and sym not in db_symbols and not self.slots.get(sym):
+                if 0 < val < 1.50 and sym not in db_symbols and sym not in dust_symbols and not self.slots.get(sym):
                     if val >= 1.0:  # MEXC يشترط $1 كحد أدنى للبيع
+                        sold = False
                         try:
                             prec_qty = float(self.ex.exchange.amount_to_precision(sym, qty * 0.99))
                             if prec_qty > 0:
                                 self.ex.exchange.create_market_sell_order(sym, prec_qty)
                                 actions.append(f"🧹 {sym}: غبار (${val:.2f}) → بيع تلقائي")
                                 _log(f"[AutoHeal] 🧹 Dust sell {sym} qty={prec_qty:.6f} val=${val:.2f}")
+                                sold = True
                         except Exception as de:
                             _log(f"[AutoHeal] ⚠️ Dust sell {sym}: {de}")
+                        # إذا فشل البيع → سجّل كـ DUST في DB مغلقة فوراً لتجنب تكرار المحاولات
+                        if not sold:
+                            try:
+                                dust_id = self.db.upsert_trade(sym, "DUST", price, qty, val,
+                                                     price * 0.5, price * 2.0, price * 2.5, price * 3.0,
+                                                     ai_verdict="dust_unsellable")
+                                if dust_id:
+                                    self.db.close_trade(dust_id, price, 0, "dust_unsellable", 0, 0)
+                                _log(f"[AutoHeal] 📌 {sym}: غبار غير قابل للبيع → سُجّل وأُغلق كـ DUST")
+                                actions.append(f"📌 {sym}: غبار (${val:.2f}) → DUST مُغلق في DB")
+                            except Exception as dbe:
+                                _log(f"[AutoHeal] ⚠️ DUST DB {sym}: {dbe}")
                     else:
-                        _log(f"[AutoHeal] 🧹 {sym}: غبار (${val:.3f}) < $1 — لا يمكن بيعه (MEXC)")
+                        # غبار < $1 ولا يمكن بيعه → سجّل في DB كـ DUST مغلقة فوراً
+                        try:
+                            dust_id = self.db.upsert_trade(sym, "DUST", price, qty, val,
+                                                 price * 0.5, price * 2.0, price * 2.5, price * 3.0,
+                                                 ai_verdict="dust_too_small")
+                            if dust_id:
+                                self.db.close_trade(dust_id, price, 0, "dust_too_small", 0, 0)
+                            _log(f"[AutoHeal] 📌 {sym}: غبار (${val:.3f}) < $1 → سُجّل وأُغلق كـ DUST")
+                            actions.append(f"📌 {sym}: غبار (${val:.3f}) → DUST مُغلق في DB")
+                        except Exception as dbe:
+                            _log(f"[AutoHeal] ⚠️ {sym}: غبار (${val:.3f}) < $1 — لا يمكن بيعه (MEXC)")
                     continue
                 if val < cap_per_slot * 0.20:
                     continue
-                if sym in db_symbols or self.slots.get(sym):
+                if sym in db_symbols or sym in dust_symbols or self.slots.get(sym):
                     continue
                 entry_est = price
                 sl  = price * (1 - self.cfg.s1_sl_pct / 100)
@@ -3053,10 +3089,12 @@ class Orchestrator:
         async with aiohttp.ClientSession(connector=connector) as session:
             scan_count    = 0
             new_listings_check_tick = 0
+            heal_tick     = 0  # AutoHeal الدوري كل 5 دقائق
 
 
             while True:
                 scan_count += 1
+                heal_tick  += 1
                 balance = self.ex.free_usdt()
                 capital = self._calc_capital()
                 slots_possible = int(balance // capital) if capital > 0 else 0
@@ -3327,6 +3365,27 @@ class Orchestrator:
                                 force_new_listing=True,
                                 free_usdt=balance
                             )
+
+                # 4. AutoHeal الدوري كل 5 دورات (≈ 5 دقائق)
+                # يكتشف الأرصدة غير المسجلة ويضيفها للDB والـ slots
+                if heal_tick >= 5:
+                    heal_tick = 0
+                    try:
+                        _log("[HealCycle] 🔄 AutoHeal دوري...")
+                        healer_cycle = AutoHeal(self.cfg, self.ex, self.slots, self.db)
+                        heal_actions = await asyncio.get_event_loop().run_in_executor(
+                            None, healer_cycle.run
+                        )
+                        # إشعار Telegram فقط إذا كان هناك إجراءات جديدة
+                        new_registrations = [a for a in heal_actions if "→ أُضيف" in a or "RESTORED" in a or "غبار" in a]
+                        if new_registrations:
+                            msg = "🔧 <b>AutoHeal — أرصدة اكتُشفت</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+                            for act in new_registrations[:8]:
+                                msg += f"• {act}\n"
+                            await self._send_tg(msg, "misc")
+                            _log(f"[HealCycle] ✅ {len(new_registrations)} رصيد جديد مُسجّل")
+                    except Exception as he:
+                        _log(f"[HealCycle] ❌ {he}")
 
                 # (Smart Report معطّل — إشعارات الصفقات فقط)
 
