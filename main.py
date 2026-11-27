@@ -139,6 +139,16 @@ class Config:
     cryptopanic_enabled: bool = field(default_factory=lambda: os.environ.get("CRYPTOPANIC_ENABLED", "false").lower() == "true")
     cryptopanic_api_key: str  = field(default_factory=lambda: os.environ.get("CRYPTOPANIC_API_KEY", ""))
     cryptopanic_block_negative: bool = True  # يمنع الدخول عند أخبار سلبية
+    cryptopanic_bullish_signal: bool = field(default_factory=lambda: os.environ.get("CRYPTOPANIC_BULLISH", "true").lower() == "true")  # خبر إيجابي = إشارة شراء
+
+    # ── Whale Alert — رصد حركات الحيتان ──
+    whale_alert_enabled: bool = field(default_factory=lambda: os.environ.get("WHALE_ALERT_ENABLED", "true").lower() == "true")
+    whale_alert_api_key: str  = field(default_factory=lambda: os.environ.get("WHALE_ALERT_API_KEY", ""))
+    whale_alert_min_usd: float = field(default_factory=lambda: float(os.environ.get("WHALE_ALERT_MIN_USD", "1000000")))  # $1M+
+
+    # ── CoinGecko Gainers (تحسين) ──
+    coingecko_gainers_enabled: bool = field(default_factory=lambda: os.environ.get("COINGECKO_GAINERS_ENABLED", "true").lower() == "true")
+    coingecko_gainers_hours:   float = field(default_factory=lambda: float(os.environ.get("COINGECKO_GAINERS_HOURS", "1.0")))  # تحديث كل ساعة
 
     # ── قائمة سوداء ──
     blacklisted_assets: set = field(default_factory=lambda: {
@@ -997,10 +1007,14 @@ class SignalAggregator:
     يُشغَّل كل 30 ثانية ويُحدّث قائمة "العملات المرشّحة".
     """
 
-    def __init__(self, cfg: Config, ex: Executor, db: TradeDB):
+    def __init__(self, cfg: Config, ex: Executor, db: TradeDB,
+                 news: "CryptoPanicFilter" = None,
+                 whale: "WhaleAlertSignal" = None):
         self.cfg   = cfg
         self.ex    = ex
         self.db    = db
+        self.news  = news   # CryptoPanic للإشارات الإيجابية
+        self.whale = whale  # WhaleAlert للتراكم الضخم
 
         # الأولويات المرشحة (symbol → score)
         self._candidates: dict[str, float] = {}
@@ -1061,22 +1075,42 @@ class SignalAggregator:
             for sym in anomalies:
                 candidates[sym] = candidates.get(sym, 0) + 7
 
-        # 5. SAFE_COINS — مضمونة التداول، أضفها دائماً بوزن متوسط
+        # 5. CryptoPanic Bullish — أخبار إيجابية = وزن إضافي
+        if self.news and self.cfg.cryptopanic_enabled and self.cfg.cryptopanic_bullish_signal:
+            bullish_bases = self.news.get_bullish_symbols()
+            for base in bullish_bases:
+                mexc_sym = f"{base}/USDT"
+                if mexc_sym in self.ex.exchange.markets:
+                    candidates[mexc_sym] = candidates.get(mexc_sym, 0) + 8  # وزن عالٍ
+                    _log(f"[News🟢] {mexc_sym}: خبر إيجابي → وزن +8")
+
+        # 6. Whale Alert — تراكم الحيتان = وزن عالٍ جداً
+        if self.whale and self.cfg.whale_alert_enabled:
+            whale_bases = self.whale.get_accumulating_symbols()
+            for base in whale_bases:
+                mexc_sym = f"{base}/USDT"
+                if mexc_sym in self.ex.exchange.markets:
+                    candidates[mexc_sym] = candidates.get(mexc_sym, 0) + 15  # وزن عالٍ جداً!
+                    _log(f"[Whale🐳] {mexc_sym}: تراكم ضخم → وزن +15")
+
+        # 7. SAFE_COINS — مضمونة التداول، أضفها دائماً بوزن متوسط
         for sym in self.ex.SAFE_COINS:
             base = sym.replace("/USDT", "")
             if base not in self.ex._geo_blocked:
                 candidates[sym] = candidates.get(sym, 0) + 3  # وزن منخفض كـ fallback
 
-        # 6. تحديث القائمة المدمجة
+        # 8. تحديث القائمة المدمجة
         with self._lock:
             self._candidates = candidates
 
+        whale_count = len(self.whale.get_accumulating_symbols()) if self.whale else 0
         total = len(candidates)
         if total:
             _log(f"[SignalAgg] 📡 {total} مرشح | "
                  f"Gainers:{len(gainers) if self.cfg.top_gainers_enabled else 0} "
                  f"Trending:{len(self._trending_coins)} "
-                 f"New:{len(self._new_listings_seen)}")
+                 f"New:{len(self._new_listings_seen)} "
+                 f"Whale:{whale_count}")
 
     def get_priority_symbols(self) -> list[tuple[str, float]]:
         """يُعيد العملات مرتّبة حسب الأولوية (الأعلى score أولاً)"""
@@ -1088,7 +1122,9 @@ class SignalAggregator:
         return symbol in self._new_listings_seen
 
     async def _fetch_coingecko_trending(self, session: aiohttp.ClientSession) -> set:
-        """يجلب أكثر 7 عملات بحثاً على CoinGecko"""
+        """يجلب أكثر 7 عملات بحثاً على CoinGecko + Top Gainers (24h)"""
+        symbols = set()
+        # ── Trending Search ──
         try:
             async with session.get(
                 "https://api.coingecko.com/api/v3/search/trending",
@@ -1096,16 +1132,44 @@ class SignalAggregator:
             ) as r:
                 if r.status == 200:
                     data = await r.json()
-                    coins = data.get("coins", [])
-                    symbols = set()
-                    for c in coins[:7]:
+                    for c in data.get("coins", [])[:7]:
                         sym = c.get("item", {}).get("symbol", "").upper()
                         if sym:
                             symbols.add(sym)
-                    return symbols
         except Exception as e:
-            _log(f"[CoinGecko] ⚠️ {e}")
-        return set()
+            _log(f"[CoinGecko] ⚠️ trending: {e}")
+
+        # ── Top Gainers (24h) — مفيد جداً كإشارة S4 ──
+        if self.cfg.coingecko_gainers_enabled:
+            try:
+                async with session.get(
+                    "https://api.coingecko.com/api/v3/coins/markets",
+                    params={
+                        "vs_currency": "usd",
+                        "order": "percent_change_24h_desc",
+                        "per_page": "20",
+                        "page": "1",
+                        "price_change_percentage": "1h,24h",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        gainers_added = 0
+                        for coin in data:
+                            sym = coin.get("symbol", "").upper()
+                            change_1h  = float(coin.get("price_change_percentage_1h_in_currency") or 0)
+                            change_24h = float(coin.get("price_change_percentage_24h") or 0)
+                            # فرصة S4: ارتفاع 1h متوسط + 24h إيجابي → تراكم مبكر
+                            if 0.5 <= change_1h <= 8.0 and change_24h > 0 and sym:
+                                symbols.add(sym)
+                                gainers_added += 1
+                        if gainers_added:
+                            _log(f"[CoinGecko] 📈 {gainers_added} عملة رابحة مضافة كمرشح S4")
+            except Exception as e:
+                _log(f"[CoinGecko] ⚠️ gainers: {e}")
+
+        return symbols
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1251,6 +1315,7 @@ class FundingRateDetector:
 class CryptoPanicFilter:
     """
     يفلتر الأخبار السلبية قبل الدخول — يمنع الشراء وقت الأخبار الحمراء.
+    محسّن: يكتشف أيضاً الأخبار الإيجابية كإشارة شراء مبكرة.
     مجاني بدون مفتاح (بيانات محدودة) أو بمفتاح مجاني (أفضل).
     """
     BASE_URL = "https://cryptopanic.com/api/v1/posts/"
@@ -1258,10 +1323,11 @@ class CryptoPanicFilter:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._negative_coins: set = set()  # عملات عليها أخبار سلبية حالية
+        self._bullish_coins:  set = set()  # عملات عليها أخبار إيجابية 🟢
         self._last_refresh: float = 0
 
     async def refresh(self, session: aiohttp.ClientSession):
-        """يحدث الأخبار كل 10 دقائق"""
+        """يحدث الأخبار كل 10 دقائق — سلبية وإيجابية"""
         if not self.cfg.cryptopanic_enabled:
             return
         now = time.time()
@@ -1269,10 +1335,16 @@ class CryptoPanicFilter:
             return
         self._last_refresh = now
 
-        params = {"filter": "negative", "public": "true"}
+        # ── جلب الأخبار السلبية ──
+        await self._fetch_filter(session, "negative")
+        # ── جلب الأخبار الإيجابية (إشارة شراء) ──
+        if self.cfg.cryptopanic_bullish_signal:
+            await self._fetch_filter(session, "bullish")
+
+    async def _fetch_filter(self, session: aiohttp.ClientSession, filter_type: str):
+        params = {"filter": filter_type, "public": "true", "kind": "news"}
         if self.cfg.cryptopanic_api_key:
             params["auth_token"] = self.cfg.cryptopanic_api_key
-
         try:
             async with session.get(
                 self.BASE_URL,
@@ -1282,18 +1354,22 @@ class CryptoPanicFilter:
                 if r.status != 200:
                     return
                 data = await r.json()
-                negative = set()
+                coins: set = set()
                 for post in data.get("results", []):
                     for currency in post.get("currencies", []):
                         sym = currency.get("code", "").upper()
                         if sym:
-                            negative.add(sym)
-                old_count = len(self._negative_coins)
-                self._negative_coins = negative
-                if negative:
-                    _log(f"[News🔴] {len(negative)} عملة عليها أخبار سلبية (منع الدخول)")
+                            coins.add(sym)
+                if filter_type == "negative":
+                    self._negative_coins = coins
+                    if coins:
+                        _log(f"[News🔴] {len(coins)} عملة بأخبار سلبية (منع الدخول)")
+                else:  # bullish
+                    self._bullish_coins = coins
+                    if coins:
+                        _log(f"[News🟢] {len(coins)} عملة بأخبار إيجابية → إشارة شراء: {', '.join(list(coins)[:5])}")
         except Exception as e:
-            _log(f"[News🔴] ⚠️ {e}")
+            _log(f"[News] ⚠️ {filter_type}: {e}")
 
     def is_blocked(self, symbol: str) -> bool:
         """يُعيد True إذا كانت العملة عليها أخبار سلبية"""
@@ -1301,6 +1377,90 @@ class CryptoPanicFilter:
             return False
         base = symbol.split("/")[0].upper()
         return base in self._negative_coins
+
+    def is_bullish(self, symbol: str) -> bool:
+        """يُعيد True إذا كان هناك خبر إيجابي للعملة (إشارة شراء مبكرة)"""
+        if not self.cfg.cryptopanic_enabled or not self.cfg.cryptopanic_bullish_signal:
+            return False
+        base = symbol.split("/")[0].upper()
+        return base in self._bullish_coins
+
+    def get_bullish_symbols(self) -> set:
+        """كل العملات ذات الأخبار الإيجابية"""
+        return self._bullish_coins.copy()
+
+
+# ══════════════════════════════════════════════════════════════
+# WHALE ALERT — رصد حركات الحيتان الكبيرة
+# ══════════════════════════════════════════════════════════════
+class WhaleAlertSignal:
+    """
+    يرصد حركات الحيتان ($1M+) عبر Whale Alert API.
+    حيتان تشتري = تراكم مبكر = فرصة شراء قبل الارتفاع.
+    مجاني: 10 طلبات/دقيقة (كافٍ للتحديث كل 5 دقائق).
+    API key مجاني من: https://whale-alert.io/account/register
+    """
+    BASE_URL = "https://api.whale-alert.io/v1/transactions"
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self._bullish_coins: set = set()  # عملات جرى تحريك ضخم فيها مؤخراً
+        self._last_refresh: float = 0
+        self._last_min_start: int = 0  # Unix timestamp آخر فحص
+
+    async def refresh(self, session: aiohttp.ClientSession):
+        """يتحقق من الحركات الضخمة كل 5 دقائق"""
+        if not self.cfg.whale_alert_enabled or not self.cfg.whale_alert_api_key:
+            return
+        now = time.time()
+        if now - self._last_refresh < 300:  # 5 دقائق
+            return
+        self._last_refresh = now
+
+        try:
+            start = int(now) - 300  # آخر 5 دقائق
+            params = {
+                "api_key": self.cfg.whale_alert_api_key,
+                "min_value": int(self.cfg.whale_alert_min_usd),
+                "start":     start,
+                "currency":  "usd",
+            }
+            async with session.get(
+                self.BASE_URL,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                if r.status != 200:
+                    _log(f"[Whale🐳] ⚠️ status={r.status}")
+                    return
+                data = await r.json()
+                txns = data.get("transactions", []) or []
+                bullish: set = set()
+                for tx in txns:
+                    sym   = tx.get("symbol", "").upper()
+                    frm   = tx.get("from", {}).get("owner_type", "")
+                    to    = tx.get("to",   {}).get("owner_type", "")
+                    amount_usd = float(tx.get("amount_usd", 0))
+                    # حيتان تنقل لمحافظ خاصة (وليس للبورصات) = تراكم
+                    if sym and frm == "exchange" and to == "unknown" and amount_usd >= self.cfg.whale_alert_min_usd:
+                        bullish.add(sym)
+                        _log(f"[Whale🐳] 💰 {sym}: ${amount_usd/1e6:.1f}M خرج من البورصة → تراكم!")
+                    # نقل ضخم من محفظة خاصة لبورصة = بيع محتمل → تجاهل
+                self._bullish_coins = bullish
+                if bullish:
+                    _log(f"[Whale🐳] 🟢 عملات بتراكم ضخم: {', '.join(bullish)}")
+        except Exception as e:
+            _log(f"[Whale🐳] ⚠️ {e}")
+
+    def is_accumulating(self, symbol: str) -> bool:
+        """يُعيد True إذا كانت الحيتان تتراكم في العملة"""
+        if not self.cfg.whale_alert_enabled:
+            return False
+        base = symbol.split("/")[0].upper()
+        return base in self._bullish_coins
+
+    def get_accumulating_symbols(self) -> set:
+        return self._bullish_coins.copy()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2717,11 +2877,14 @@ class Orchestrator:
         self.slots._free_usdt_fn = self.ex.free_usdt  # ربط الرصيد الحر الديناميكي
         self.strategy  = StrategyEngine(cfg, self.ex)
         self.ai        = AIAdvisor(cfg)
-        self.signals   = SignalAggregator(cfg, self.ex, self.db)
         self.binance   = BinanceListingMonitor(cfg, self.ex)
         self.funding   = FundingRateDetector(cfg)
         self.news      = CryptoPanicFilter(cfg)
         self.lunar     = LunarCrushSignal(cfg)
+        self.whale     = WhaleAlertSignal(cfg)
+        # SignalAggregator يحصل على مراجع CryptoPanic + Whale لدمج إشاراتها
+        self.signals   = SignalAggregator(cfg, self.ex, self.db,
+                                          news=self.news, whale=self.whale)
         self.fear_greed = FearGreedIndex()
         self.btc_filter = BTCTrendFilter(self.ex)
         self.oi_monitor = OpenInterestMonitor()
@@ -2771,9 +2934,13 @@ class Orchestrator:
         if self.cfg.funding_rate_enabled:
             sources.append("📉 Funding Rate")
         if self.cfg.cryptopanic_enabled:
-            sources.append("🔴 News Filter")
+            sources.append("🔴🟢 News Signals")
         if self.cfg.lunarcrush_enabled:
             sources.append("🌙 LunarCrush")
+        if self.cfg.whale_alert_enabled and self.cfg.whale_alert_api_key:
+            sources.append("🐳 Whale Alert")
+        if self.cfg.coingecko_gainers_enabled:
+            sources.append("📈 CoinGecko Gainers")
 
         text = (
             "🚀 <b>MEXC Scalping Bot v5 — Ultra Rocket Edition</b>\n"
@@ -2907,6 +3074,16 @@ class Orchestrator:
                 _log(f"[LunarCrush🌙] 🔥 {symbol} Galaxy Score={score:.0f} — ضجة اجتماعية!")
                 signal["lunar_boost"] = True
 
+            # CryptoPanic Bullish — خبر إيجابي = boost
+            if self.news.is_bullish(symbol):
+                _log(f"[News🟢] 🔥 {symbol} خبر إيجابي — نقاط إضافية!")
+                signal["news_bullish"] = True
+
+            # Whale Alert — تراكم الحيتان = boost قوي جداً
+            if self.whale.is_accumulating(symbol):
+                _log(f"[Whale🐳] 💰 {symbol} تراكم ضخم للحيتان — نقاط إضافية!")
+                signal["whale_accumulating"] = True
+
             # Order Book Pressure — فلتر إضافي (يُتجاوز لـ SAFE_COINS)
             _SAFE_SET = {s.replace("/USDT","") for s in self.ex.SAFE_COINS}
             _is_safe_coin = symbol.replace("/USDT","") in _SAFE_SET
@@ -3029,6 +3206,8 @@ class Orchestrator:
             if signal.get("fg_extreme_greed"):  boosts.append(f"🤑 Greed={self.fear_greed.value}")
             if signal.get("oi_warning"):        boosts.append("⚠️ OI↑ Liquidation Risk")
             if signal_source == "binance_listing": boosts.append("📢 Binance Listed!")
+            if signal.get("news_bullish"):         boosts.append("🟢 خبر إيجابي")
+            if signal.get("whale_accumulating"):   boosts.append("🐳 Whale Accumulation")
             boost_note = (" | " + " + ".join(boosts)) if boosts else ""
             src_tag = f" [{signal_source}]" if signal_source != "scan" else ""
             fg_line = f"🌡 F&G: {self.fear_greed.value}/100 {self.fear_greed.label} | BTC 1H: {self.btc_filter.change_1h:+.1f}%\n" if self.cfg.fear_greed_enabled else ""
@@ -3176,6 +3355,12 @@ class Orchestrator:
                         await self.lunar.refresh(session)
                     except Exception as e:
                         _log(f"[LunarCrush] ⚠️ {e}")
+
+                    # تحديث Whale Alert — رصد تراكم الحيتان
+                    try:
+                        await self.whale.refresh(session)
+                    except Exception as e:
+                        _log(f"[Whale🐳] ⚠️ {e}")
 
                     # تحديث Fear & Greed Index
                     if self.cfg.fear_greed_enabled:
