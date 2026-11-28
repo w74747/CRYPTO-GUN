@@ -2431,8 +2431,15 @@ class TradeMonitor:
 
             # ─── TP1 تم تحقيقه فعلاً (سعر تجاوز TP1) ───
             elif old_tp1 > 0 and price >= old_tp1 * 0.98:
-                new_sl = max(old_sl, state.entry_price * 1.001)
-                note = f"✅ TP1 مُحقَّق → SL رُفع للتعادل {new_sl:.6g}"
+                if not state.partial1_done:
+                    # ✅ بيع 50% الآن + رفع SL للتعادل + تفعيل trailing
+                    await self._on_tp1_filled(state, price)
+                    self.slots.update(sym, last_target_review=now)
+                    return  # _on_tp1_filled تتولى كل شيء
+                else:
+                    # partial1 مكتمل بالفعل → فقط تأكد SL عند التعادل
+                    new_sl = max(old_sl, state.entry_price * 1.001)
+                    note = f"✅ TP1 محقق (partial مكتمل) → SL={new_sl:.6g}"
 
             # ─── TP1 لا يزال أمامنا ───
             elif old_tp1 > 0:
